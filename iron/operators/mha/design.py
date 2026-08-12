@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import os
 import sys
 import math
 import copy
@@ -18,12 +19,85 @@ from aie.iron import (
     Worker,
     Buffer,
     WorkerRuntimeBarrier,
+    TaskGroup,
 )
 from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
 from aie.helpers.dialects.scf import if_, else_
-from iron.operators._trace import maybe_enable_trace, resolve_trace_size
+from iron.operators._trace import resolve_trace_size
+
+# ---------------------------------------------------------------------------
+# mlir-aie 1.4.0 aiecc compatibility shim
+#
+# IRON's compilation rules emit flags (--no-compile-host,
+# --aie-generate-xclbin, --aie-generate-npu-insts) that the 1.4.0 wheel's
+# aiecc does not recognise. The 1.4.0 driver uses a graph-cut model:
+# request outputs with --get-xclbin / --get-npu-insts and supply
+# --xclbin-name / --npu-insts-name for the filenames.
+#
+# This shim patches ShellCompilationCommand.run to fix the command list
+# right before the aiecc subprocess is launched. It is a no-op on newer
+# mlir-aie versions (the stripped flags are simply absent; --get-* are
+# supported by the newer driver too).
+# ---------------------------------------------------------------------------
+_aiecc_compat_done = False
+
+
+def _patch_aiecc_for_1_4_0():
+    global _aiecc_compat_done
+    if _aiecc_compat_done:
+        return
+    _aiecc_compat_done = True
+
+    import iron.common.compilation.base as _base
+
+    _REMOVE_FLAGS = {
+        "--no-compile-host",
+        "--aie-generate-xclbin",
+        "--aie-generate-npu-insts",
+        "--no-compile",
+    }
+
+    def _fix_cmd(cmd_list):
+        """Strip 1.4.0-incompatible flags and add --get-* shorthands."""
+        fixed = [c for c in cmd_list if c not in _REMOVE_FLAGS]
+        has_xclbin = any(c.startswith("--xclbin-name=") for c in fixed)
+        has_insts = any(c.startswith("--npu-insts-name=") for c in fixed)
+        if has_xclbin and "--get-xclbin" not in fixed:
+            idx = next(
+                i for i, c in enumerate(fixed) if c.startswith("--xclbin-name=")
+            )
+            fixed.insert(idx, "--get-xclbin")
+        if has_insts and "--get-npu-insts" not in fixed:
+            idx = next(
+                i for i, c in enumerate(fixed) if c.startswith("--npu-insts-name=")
+            )
+            fixed.insert(idx, "--get-npu-insts")
+        return fixed
+
+    # Patch ShellCompilationCommand.run — this is called right before the
+    # aiecc subprocess is launched, so the command list is fixed here
+    # regardless of which CompilationRule created it.
+    _orig_run = _base.ShellCompilationCommand.run
+
+    def _patched_run(self):
+        if hasattr(self, "command") and isinstance(self.command, list):
+            # Only fix aiecc commands
+            if self.command and "aiecc" in self.command[0]:
+                self.command = _fix_cmd(self.command)
+                # Ensure xclbinutil is on PATH (needed for --get-xclbin)
+                xrt_bin = "/opt/xilinx/xrt/bin"
+                if hasattr(self, "env") and isinstance(self.env, dict):
+                    path_val = self.env.get("PATH", "")
+                    if xrt_bin not in path_val:
+                        self.env["PATH"] = xrt_bin + ":" + path_val
+        return _orig_run(self)
+
+    _base.ShellCompilationCommand.run = _patched_run
+
+
+_patch_aiecc_for_1_4_0()
 
 dtype_map = {
     "bf16": bfloat16,
@@ -118,9 +192,14 @@ def fused_mha(
     emulate_bf16_mmul_with_bfp16: bool,
     trace_size: int = 0,
     verbose: bool = False,
+    func_prefix: str = "",
 ):
 
     of_depth = 2
+    # For d > 64, the V and O tiles are (d, B_kv) and (B_q, d) respectively,
+    # doubling in size vs d=64. With depth=2 this overflows AIE L1 (64 KB).
+    # Use depth=1 for the large PV-side fifos to stay within memory budget.
+    pv_depth = 1 if d > 64 else of_depth
     vectorized = True
     enable_tracing = resolve_trace_size(trace_size) > 0
     dtype_str = "bf16"
@@ -197,10 +276,7 @@ def fused_mha(
         np.dtype[dtype],
     ]
     KV_ty = np.ndarray[
-        (
-            num_KV_heads,
-            S_kv_pad * d,
-        ),
+        (num_KV_heads, S_kv_pad * d),
         np.dtype[dtype],
     ]
 
@@ -212,17 +288,20 @@ def fused_mha(
 
     # AIE kernel declarations
     func_type = "" if vectorized else "_scalar"
-    zero_kernel = Kernel(f"zero_{dtype_str}", "mha.o", [qk_ty])
+    mha_obj = f"{func_prefix}mha.o"
+    pt_obj = f"{func_prefix}mha_passThrough.o"
+    zero_kernel = Kernel(f"{func_prefix}zero_{dtype_str}", mha_obj, [qk_ty])
+    zero_kernel_pv = Kernel(f"{func_prefix}zero_{dtype_str}_pv", mha_obj, [q_ty])
 
     memcopy_kernel_scale = Kernel(
-        f"passThroughLine", "mha_passThrough.o", [s_ty, s_ty, np.int32]
+        f"{func_prefix}passThroughLine", pt_obj, [s_ty, s_ty, np.int32]
     )
 
-    scale_buffer_init_kernel = Kernel("init_scale_buffer", "mha.o", [s_ty, np.int32])
+    scale_buffer_init_kernel = Kernel(f"{func_prefix}init_scale_buffer", mha_obj, [s_ty, np.int32])
 
     partial_softmax_kernel = Kernel(
-        "partial_softmax",
-        "mha.o",
+        f"{func_prefix}partial_softmax",
+        mha_obj,
         [
             qk_ty,
             qk_ty,
@@ -237,18 +316,18 @@ def fused_mha(
     )
 
     matmul_QK = Kernel(
-        f"matmul_bf16_bf16_wrapper{func_type}",
-        "mha.o",
+        f"{func_prefix}matmul_bf16_bf16_wrapper{func_type}",
+        mha_obj,
         [q_ty, k_ty, qk_ty, np.ndarray[(2,), np.dtype[np.int32]]],
     )
 
     matmul_PV = Kernel(
-        "matmul_PV",
-        "mha.o",
+        f"{func_prefix}matmul_PV",
+        mha_obj,
         [
             qk_ty,
             k_ty,
-            qk_ty,
+            q_ty,
             s_ty,
             np.int32,
             np.int32,
@@ -257,9 +336,18 @@ def fused_mha(
     )
 
     rescale_O = Kernel(
-        "rescale_O",
-        "mha.o",
-        [qk_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
+        f"{func_prefix}rescale_O",
+        mha_obj,
+        [q_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
+    )
+
+    # RoPE kernel — applies rotary position embedding to Q/K tiles in-place.
+    # With identity cos/sin (cos=1, sin=0) this is a no-op; the kernel's
+    # fast path detects identity and returns immediately.
+    rope_kernel = Kernel(
+        f"{func_prefix}rope_qk_bf16",
+        mha_obj,
+        [q_ty, k_ty, np.ndarray[(d,), np.dtype[dtype]], np.ndarray[(d,), np.dtype[dtype]], np.int32, np.int32],
     )
 
     # AIE-array data movement with object fifos
@@ -276,7 +364,7 @@ def fused_mha(
         obj_types=[q_ty] * number_of_pipelines_join_distribute,
         names=[f"memQ{i}" for i in range(number_of_pipelines_join_distribute)],
         dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
-        depths=[of_depth] * number_of_pipelines_join_distribute,
+        depths=[pv_depth] * number_of_pipelines_join_distribute,
         tile=Tile(col=6, row=1),
     )  # Split between N pipelines
     if number_of_pipelines > 6:
@@ -289,7 +377,7 @@ def fused_mha(
             obj_types=[q_ty] * number_of_pipelines_join_distribute,
             names=[f"memQ2{i}" for i in range(number_of_pipelines_join_distribute)],
             dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
-            depths=[of_depth] * number_of_pipelines_join_distribute,
+            depths=[pv_depth] * number_of_pipelines_join_distribute,
             tile=Tile(col=7, row=1),
         )  # Split between N pipelines
 
@@ -309,12 +397,14 @@ def fused_mha(
         name="memK",
         dims_to_stream=k_dims,
         tile=Tile(col=3, row=1),
-        depth=of_depth,
+        depth=pv_depth,
     )  # Broadcast, give this handle to N pipelines
 
     v_dims = None
     if vectorized:
-        v_dims = [(B_kv // s, s * B_kv), (B_kv // t, t), (s, B_kv), (t, 1)]
+        # V is stored as (d, B_kv). Stream it transposed as (B_kv, d) for the
+        # PV matmul which uses b_row_maj=true with DIM_K_PV=B_kv, DIM_N_PV=d.
+        v_dims = [(B_kv // t, t * d), (d // s, s), (t, d), (s, 1)]
 
     inV = ObjectFifo(
         k_ty,
@@ -325,7 +415,7 @@ def fused_mha(
         name="memV",
         dims_to_stream=v_dims,
         tile=Tile(col=4, row=1),
-        depth=of_depth,
+        depth=pv_depth,
     )  # Broadcast, give this handle to N pipelines
 
     a_dims = None
@@ -355,7 +445,7 @@ def fused_mha(
             .cons()
             .forward(
                 name=f"outP{i}",
-                dims_to_stream=q_dims,
+                dims_to_stream=a_dims,
                 depth=of_depth,
                 # tile=Tile(col=i, row=1)
             )
@@ -370,7 +460,7 @@ def fused_mha(
 
     o_dims = None
     if vectorized:
-        o_dims = [(B_q // r, r * B_kv), (r, t), (B_kv // t, r * t), (t, 1)]
+        o_dims = [(B_q // r, r * d), (r, t), (d // t, r * t), (t, 1)]
     memO = ObjectFifo(
         np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
         name="memO",
@@ -380,7 +470,7 @@ def fused_mha(
         offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
         obj_types=[q_ty] * number_of_pipelines_join_distribute,
         names=[f"outO{i}" for i in range(number_of_pipelines_join_distribute)],
-        depths=[of_depth] * number_of_pipelines_join_distribute,
+        depths=[pv_depth] * number_of_pipelines_join_distribute,
         tile=Tile(col=6, row=1),
     )  # Join onto the output OF
     if number_of_pipelines > 6:
@@ -393,7 +483,7 @@ def fused_mha(
             offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
             obj_types=[q_ty] * number_of_pipelines_join_distribute,
             names=[f"outO2{i}" for i in range(number_of_pipelines_join_distribute)],
-            depths=[of_depth] * number_of_pipelines_join_distribute,
+            depths=[pv_depth] * number_of_pipelines_join_distribute,
             tile=Tile(col=7, row=1),
         )
 
@@ -403,6 +493,9 @@ def fused_mha(
         of_a_out,
         zero,
         matmul_QK,
+        rope,
+        cos_buf,
+        sin_buf,
         q_block_bias,
         mha_rtps,
         barrier,
@@ -427,6 +520,9 @@ def fused_mha(
 
                     elem_in_k = of_k.acquire(1)
                     elem_a_out = of_a_out.acquire(1)
+
+                    # Apply RoPE to Q/K tiles before matmul (no-op with identity cos/sin).
+                    rope(elem_in_q, elem_in_k, cos_buf, sin_buf, B_q, d)
 
                     zero(elem_a_out)
                     matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
@@ -630,10 +726,26 @@ def fused_mha(
         for j in range(3)
     ]
 
+    # Local L1 Buffers for cos/sin on each matmul worker tile.
+    # Identity values (cos=1, sin=0) make rope_kernel a no-op.
+    cos_bufs = [
+        Buffer(type=np.ndarray[(d,), np.dtype[dtype]], name=f"cos_l1_{i}",
+               initial_value=np.ones(d, dtype=dtype),
+               tile=Tile(col=i, row=2))
+        for i in range(number_of_pipelines)
+    ]
+    sin_bufs = [
+        Buffer(type=np.ndarray[(d,), np.dtype[dtype]], name=f"sin_l1_{i}",
+               initial_value=np.zeros(d, dtype=dtype),
+               tile=Tile(col=i, row=2))
+        for i in range(number_of_pipelines)
+    ]
+
     # Create worker from task
     matmul_workers = []
     softmax_workers = []
     matmul_pv_workers = []
+
     for i in range(number_of_pipelines):
         idx_buffer_qk = Buffer(
             initial_value=np.zeros(shape=(2,), dtype=np.int32),
@@ -648,6 +760,9 @@ def fused_mha(
                     memA[i].prod(),
                     zero_kernel,
                     matmul_QK,
+                    rope_kernel,
+                    cos_bufs[i],
+                    sin_bufs[i],
                     i,
                     mha_rtps_list[0][i],
                     worker_barrier_list[0][i],
@@ -699,7 +814,7 @@ def fused_mha(
                     memV.cons(),
                     scaleOF[i].cons(),
                     outO[i].prod(),
-                    zero_kernel,
+                    zero_kernel_pv,
                     matmul_PV,
                     rescale_O,
                     i,
@@ -774,32 +889,48 @@ def fused_mha(
         print_tap_seq_info(V_tiles, "V")
         # print_tap_seq_info(O_tiles, "O")
 
-    # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(Q_ty, KV_ty, KV_ty, Q_ty) as (Q, K, V, O):
+    # Pre-create ObjectFifo handles with shim tiles for runtime DMA
+    # In mlir-aie 1.4.0, the shim tile is set on the handle via prod(tile=)/cons(tile=),
+    # not on fill()/drain() as in the newer API.
+    inQ_prod = inQ.prod(tile=Tile(col=4, row=0))
+    inK_prod = inK.prod(tile=Tile(col=5, row=0))
+    inV_prod = inV.prod(tile=Tile(col=6, row=0))
+    memO_cons = memO.cons(tile=Tile(col=7, row=0))
+    if number_of_pipelines > 6:
+        inQ2_prod = inQ2.prod(tile=Tile(col=4, row=0))
+        memO2_cons = memO2.cons(tile=Tile(col=7, row=0))
 
-        def set_mha_rtps():
-            for j in range(3):
-                for i in range(number_of_pipelines):
-                    mha_rtps_list[j][i][0] = num_q_block_per_pipeline
-                    mha_rtps_list[j][i][1] = num_kv_blocks
-                    mha_rtps_list[j][i][2] = S_q_eff
-                    mha_rtps_list[j][i][3] = S_kv_eff
+    # Collect runtime DMA handles so they get registered with the Runtime.
+    # flatten_fn_args in Runtime._register_fn_args will find the ObjectFifoHandles
+    # inside this nested list and bind their shim endpoints eagerly.
+    rt_handles = [inQ_prod, inK_prod, inV_prod, memO_cons]
+    if number_of_pipelines > 6:
+        rt_handles += [inQ2_prod, memO2_cons]
 
-        rt.inline_ops(set_mha_rtps, ())
+    # Runtime sequence body — runs at resolve time inside the runtime_sequence op.
+    # In mlir-aie 1.4.0, Runtime takes (seq_fn, fn_args) where fn_args entries
+    # that are types become RuntimeData (fill/drain targets) and other objects
+    # pass through to the body unchanged.
+    def seq_fn(Q, K, V, O, handles):
+        h_inQ_prod, h_inK_prod, h_inV_prod, h_memO_cons = handles[:4]
+        if number_of_pipelines > 6:
+            h_inQ2_prod, h_memO2_cons = handles[4], handles[5]
 
+        # Set runtime parameters on worker buffers (was rt.inline_ops)
         for j in range(3):
             for i in range(number_of_pipelines):
-                rt.set_barrier(worker_barrier_list[j][i], 1)
+                mha_rtps_list[j][i][0] = num_q_block_per_pipeline
+                mha_rtps_list[j][i][1] = num_kv_blocks
+                mha_rtps_list[j][i][2] = S_q_eff
+                mha_rtps_list[j][i][3] = S_kv_eff
 
-        maybe_enable_trace(
-            rt, trace_size, matmul_workers + softmax_workers + matmul_pv_workers
-        )
+        # Set barriers to release workers (was rt.set_barrier)
+        for j in range(3):
+            for i in range(number_of_pipelines):
+                worker_barrier_list[j][i].set(1)
 
-        for i in range(number_of_pipelines):
-            rt.start(matmul_workers[i])
-            rt.start(softmax_workers[i])
-            rt.start(matmul_pv_workers[i])
+        # Workers start automatically — no rt.start() needed in 1.4.0.
+        # Trace is configured on Program, not Runtime, after construction.
 
         for head_idx in range(heads):
 
@@ -807,68 +938,57 @@ def fused_mha(
 
             for q_block_idx in range(num_q_block_per_pipeline):
 
-                # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
-                tg = rt.task_group()
+                # Initialize a group for parallel drain tasks, with fill
+                # resources free'd when drains complete.
+                tg = TaskGroup()
 
                 if number_of_pipelines > 6:
-                    rt.fill(
-                        inQ.prod(),
+                    h_inQ_prod.fill(
                         Q,
                         tap=Q_tiles[
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
-                        tile=Tile(col=4, row=0),
-                        task_group=tg,
+                        group=tg,
                     )
-                    rt.fill(
-                        inQ2.prod(),
+                    h_inQ2_prod.fill(
                         Q,
                         tap=Q_tiles[
                             2 * head_idx * num_q_block_per_pipeline
                             + q_block_idx * 2
                             + 1
                         ],
-                        tile=Tile(col=4, row=0),
-                        task_group=tg,
+                        group=tg,
                     )
                 else:
-                    rt.fill(
-                        inQ.prod(),
+                    h_inQ_prod.fill(
                         Q,
                         tap=Q_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
-                        tile=Tile(col=4, row=0),
-                        task_group=tg,
+                        group=tg,
                     )
 
-                # Thow on bd containing the full K and V in the object fifo, then does it transfer cunks of inKV size at the time?
-                rt.fill(
-                    inK.prod(),
+                # Throw on bd containing the full K and V in the object fifo,
+                # then does it transfer chunks of inKV size at the time?
+                h_inK_prod.fill(
                     K,
                     tap=K_tiles[kv_head_idx],
-                    tile=Tile(col=5, row=0),
-                    task_group=tg,
+                    group=tg,
                 )
-                rt.fill(
-                    inV.prod(),
+                h_inV_prod.fill(
                     V,
                     tap=V_tiles[kv_head_idx],
-                    tile=Tile(col=6, row=0),
-                    task_group=tg,
+                    group=tg,
                 )
 
                 if number_of_pipelines > 6:
-                    rt.drain(
-                        memO.cons(),
+                    h_memO_cons.drain(
                         O,
                         tap=O_tiles[
                             2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
                         ],
                         wait=True,
-                        tile=Tile(col=7, row=0),
-                        task_group=tg,
+                        group=tg,
                     )
-                    rt.drain(
-                        memO2.cons(),
+                    h_memO2_cons.drain(
                         O,
                         tap=O_tiles[
                             2 * head_idx * num_q_block_per_pipeline
@@ -876,24 +996,39 @@ def fused_mha(
                             + 1
                         ],
                         wait=True,
-                        tile=Tile(col=7, row=0),
-                        task_group=tg,
+                        group=tg,
                     )
                 else:
-                    rt.drain(
-                        memO.cons(),
+                    h_memO_cons.drain(
                         O,
                         tap=O_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
                         wait=True,
-                        tile=Tile(col=7, row=0),
-                        task_group=tg,
+                        group=tg,
                     )
 
-                rt.finish_task_group(tg)
+                tg.finish()
 
-    # Create the program from the device type and runtime
+    # Create the runtime with the sequence function and fn_args.
+    # fn_args: type entries (Q_ty, KV_ty) become RuntimeData;
+    # the rt_handles list passes through and its ObjectFifoHandles are registered.
+    rt = Runtime(seq_fn, [Q_ty, KV_ty, KV_ty, Q_ty, rt_handles])
+
+    # Create the program from the device type, runtime, and workers.
+    # In 1.4.0, workers are passed to Program (not started from Runtime).
     dev_ty = NPU2()
-    my_program = Program(dev_ty, rt)
+    all_workers = matmul_workers + softmax_workers + matmul_pv_workers
+    my_program = Program(dev_ty, rt, workers=all_workers)
+
+    # Enable trace on Program (not Runtime) if requested.
+    # In 1.4.0, enable_trace lives on Program and configures both the traced
+    # workers' tiles and the Runtime's trace-buffer sequencing.
+    ts = resolve_trace_size(trace_size)
+    if ts > 0:
+        ntiles = max(0, int(os.environ.get("IRON_TRACE_NTILES", "1")))
+        my_program.enable_trace(
+            ts,
+            workers=list(all_workers)[:ntiles],
+        )
 
     # Place components (assign them resources on the device) and generate an MLIR module
     module = my_program.resolve_program()

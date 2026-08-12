@@ -27,6 +27,334 @@ from . import (
     MLIRArtifact,
 )
 
+# ---------------------------------------------------------------------------
+# mlir-aie 1.4.0 compatibility shim
+#
+# In 1.4.0 the Runtime class API changed: Runtime(seq_fn, fn_args) where
+# seq_fn is a plain callback and fn_args entries that are types become
+# RuntimeData.  The old API (Runtime() with no args, then rt.sequence(),
+# rt.start(), rt.fill(), rt.drain(), rt.task_group(), etc.) no longer works.
+#
+# Many IRON design modules (binary_elementwise_design, channeled_unary_design,
+# softmax, gemv, etc.) still use the old API.  This shim patches Runtime so
+# the old-style calls are accepted: operations are recorded during the
+# rt.sequence() context-manager body and replayed inside the real seq_fn
+# callback when Program.resolve_program() calls rt.resolve().
+#
+# The shim also patches ShellCompilationCommand.run to strip aiecc flags that
+# 1.4.0's aiecc does not recognise (--no-compile-host, --aie-generate-xclbin,
+# --aie-generate-npu-insts, --no-compile) and adds --get-xclbin / --get-npu-insts
+# shorthands.  This is the same patch already applied by mha/design.py and
+# gemm/design.py; the guard prevents double-patching.
+# ---------------------------------------------------------------------------
+
+import contextlib
+import itertools
+import os
+
+_1_4_0_patch_done = False
+
+
+def _patch_for_1_4_0():
+    global _1_4_0_patch_done
+    if _1_4_0_patch_done:
+        return
+    _1_4_0_patch_done = True
+
+    from typing import get_origin
+    import numpy as _np
+
+    from aie.iron.runtime.runtime import Runtime as _Runtime
+    from aie.iron.program import Program as _Program
+    from aie.iron.runtime.data import RuntimeData
+    from aie.iron.runtime.taskgroup import TaskGroup as _TaskGroup
+    from aie.iron.runtime.endpoint import RuntimeEndpoint
+    from aie.iron.runtime.runtime import sync_parameters as _sync_parameters
+
+    _orig_runtime_init = _Runtime.__init__
+    _orig_resolve = _Runtime.resolve
+    _orig_program_init = _Program.__init__
+
+    # -- Placeholder / recording helpers -----------------------------------
+
+    class _Placeholder:
+        """Stand-in for a runtime input, replaced by the real SSA value
+        during ``resolve()`` replay."""
+        __slots__ = ("idx", "type_", "real")
+
+        def __init__(self, idx, type_):
+            self.idx = idx
+            self.type_ = type_
+            self.real = None
+
+    class _RecordedTaskGroup:
+        """Recording-phase stand-in for a TaskGroup; swapped for the real
+        TaskGroup during replay."""
+        pass
+
+    def _convert_kwargs(kwargs, tg_map):
+        """Rename old-style ``task_group=`` to 1.4.0 ``group=``."""
+        out = {}
+        for k, v in kwargs.items():
+            if k == "task_group":
+                out["group"] = tg_map.get(v, v)
+            else:
+                out[k] = v
+        return out
+
+    # -- Runtime.__init__ shim ---------------------------------------------
+
+    def _compat_init(self, seq_fn=None, fn_args=None, *, strict_task_groups=True):
+        if seq_fn is not None:
+            # New 1.4.0 API — delegate to the original constructor.
+            _orig_runtime_init(self, seq_fn, fn_args, strict_task_groups=strict_task_groups)
+            return
+
+        # Old API: Runtime() with no arguments.
+        # Fields are populated lazily by sequence() / fill() / drain() …
+        # and finalised in _compat_resolve().
+        self._compat_types = None
+        self._compat_workers = []
+        self._compat_trace = None
+        self._compat_recorded = []
+        self._compat_placeholders = []
+
+        # Initialise the fields that Program.resolve_program() inspects so
+        # they exist even before _compat_resolve() populates the real ones.
+        self._seq_fn = None
+        self._fn_args = []
+        self._const_inputs = []
+        self._rt_data = []
+        self._fifos = set()
+        self._flows = []
+        self._locks = []
+        self._tile_dmas = []
+        self._scratchpad_parameters = []
+        self._strict_task_groups = strict_task_groups
+        self._task_group_index = itertools.count()
+
+    # -- Old-style Runtime methods (record for later replay) ---------------
+
+    def _sequence(self, *types):
+        self._compat_types = types
+        self._compat_placeholders = [_Placeholder(i, t) for i, t in enumerate(types)]
+
+        @contextlib.contextmanager
+        def _ctx():
+            yield tuple(self._compat_placeholders)
+
+        return _ctx()
+
+    def _start(self, *workers):
+        self._compat_workers = list(workers)
+
+    def _fill(self, handle, source, *args, **kwargs):
+        self._compat_recorded.append(("fill", handle, source, args, kwargs))
+        if hasattr(handle, "_object_fifo"):
+            if handle.endpoint is None:
+                handle.endpoint = RuntimeEndpoint(handle._shim_tile)
+            self._fifos.add(handle)
+
+    def _drain(self, handle, dest, *args, **kwargs):
+        self._compat_recorded.append(("drain", handle, dest, args, kwargs))
+        if hasattr(handle, "_object_fifo"):
+            if handle.endpoint is None:
+                handle.endpoint = RuntimeEndpoint(handle._shim_tile)
+            self._fifos.add(handle)
+
+    def _task_group(self):
+        tg = _RecordedTaskGroup()
+        self._compat_recorded.append(("task_group", tg))
+        return tg
+
+    def _finish_task_group(self, tg):
+        self._compat_recorded.append(("finish_task_group", tg))
+
+    def _sync_parameters(self):
+        self._compat_recorded.append(("sync_parameters",))
+
+    def _inline_ops(self, fn, *args):
+        self._compat_recorded.append(("inline_ops", fn, args))
+
+    def _set_barrier(self, barrier, value):
+        self._compat_recorded.append(("set_barrier", barrier, value))
+
+    def _enable_trace(self, trace_size, workers=None, **kwargs):
+        self._compat_trace = (trace_size, workers, kwargs)
+
+    # -- Runtime.resolve shim ----------------------------------------------
+    # When the Runtime was created with the old API (no seq_fn), build a
+    # seq_fn callback from the recorded operations, populate the fields the
+    # original resolve() expects, then delegate to the original resolve().
+
+    def _compat_resolve(
+        self,
+        loc=None,
+        ip=None,
+        *,
+        trace_size=None,
+        reuse_output_buffer=False,
+        egress_shim_col=0,
+        load_pdi_device_ref=None,
+    ):
+        if not hasattr(self, "_compat_types"):
+            # New API — call original resolve directly.
+            _orig_resolve(
+                self,
+                loc=loc,
+                ip=ip,
+                trace_size=trace_size,
+                reuse_output_buffer=reuse_output_buffer,
+                egress_shim_col=egress_shim_col,
+                load_pdi_device_ref=load_pdi_device_ref,
+            )
+            return
+
+        types = self._compat_types or []
+        placeholders = self._compat_placeholders
+        recorded = self._compat_recorded
+        tg_map = {}
+
+        def seq_fn(*real_args):
+            # Bind placeholders to the real SSA / RuntimeData values.
+            for ph, real in zip(placeholders, real_args):
+                ph.real = real
+
+            for record in recorded:
+                op = record[0]
+                if op == "fill":
+                    _, handle, source, args, kwargs = record
+                    if isinstance(source, _Placeholder):
+                        source = source.real
+                    handle.fill(source, *args, **_convert_kwargs(kwargs, tg_map))
+                elif op == "drain":
+                    _, handle, dest, args, kwargs = record
+                    if isinstance(dest, _Placeholder):
+                        dest = dest.real
+                    handle.drain(dest, *args, **_convert_kwargs(kwargs, tg_map))
+                elif op == "task_group":
+                    _, tg_ph = record
+                    tg_map[tg_ph] = _TaskGroup()
+                elif op == "finish_task_group":
+                    _, tg_ph = record
+                    tg_map[tg_ph].finish()
+                elif op == "sync_parameters":
+                    _sync_parameters()
+                elif op == "inline_ops":
+                    _, fn, args = record
+                    fn(*args)
+                elif op == "set_barrier":
+                    _, barrier, value = record
+                    barrier.set(value)
+
+        # Populate the fields that original __init__ would have set.
+        self._seq_fn = seq_fn
+        self._fn_args = list(types)
+        self._const_inputs = [
+            v if isinstance(v, (int, _np.integer)) and not isinstance(v, bool) else None
+            for v in self._fn_args
+        ]
+        self._rt_data = [
+            RuntimeData(arg)
+            if c is None
+            and (isinstance(arg, type) or get_origin(arg) is _np.ndarray)
+            else None
+            for c, arg in zip(self._const_inputs, self._fn_args)
+        ]
+        self._register_fn_args()
+
+        _orig_resolve(
+            self,
+            loc=loc,
+            ip=ip,
+            trace_size=trace_size,
+            reuse_output_buffer=reuse_output_buffer,
+            egress_shim_col=egress_shim_col,
+            load_pdi_device_ref=load_pdi_device_ref,
+        )
+
+    # Apply Runtime patches.
+    _Runtime.__init__ = _compat_init
+    _Runtime.sequence = _sequence
+    _Runtime.start = _start
+    _Runtime.fill = _fill
+    _Runtime.drain = _drain
+    _Runtime.task_group = _task_group
+    _Runtime.finish_task_group = _finish_task_group
+    _Runtime.sync_parameters = _sync_parameters
+    _Runtime.inline_ops = _inline_ops
+    _Runtime.set_barrier = _set_barrier
+    _Runtime.enable_trace = _enable_trace
+    _Runtime.resolve = _compat_resolve
+
+    # -- Program.__init__ shim ---------------------------------------------
+    # Extract workers and trace config from a compat Runtime so that
+    # Program(dev, rt) works without explicit workers=.
+
+    def _compat_program_init(self, device, rt, workers=None):
+        if workers is None and hasattr(rt, "_compat_workers"):
+            workers = rt._compat_workers
+        _orig_program_init(self, device, rt, workers)
+        if hasattr(rt, "_compat_trace") and rt._compat_trace is not None:
+            trace_size, trace_workers, kwargs = rt._compat_trace
+            self.enable_trace(trace_size=trace_size, workers=trace_workers, **kwargs)
+
+    _Program.__init__ = _compat_program_init
+
+    # -- aiecc flag patching ------------------------------------------------
+
+    import iron.common.compilation.base as _base
+
+    _REMOVE_FLAGS = {
+        "--no-compile-host",
+        "--aie-generate-xclbin",
+        "--aie-generate-npu-insts",
+        "--no-compile",
+        "--generate-full-elf",  # 1.4.0 uses --full-elf-name= directly
+    }
+
+    def _fix_cmd(cmd_list):
+        fixed = [c for c in cmd_list if c not in _REMOVE_FLAGS]
+        # Convert "--full-elf-name <path>" to "--full-elf-name=<path>"
+        for i, c in enumerate(fixed):
+            if c == "--full-elf-name" and i + 1 < len(fixed):
+                fixed[i] = f"--full-elf-name={fixed[i + 1]}"
+                fixed[i + 1] = None  # remove next arg (already consumed)
+        fixed = [c for c in fixed if c is not None]
+        has_xclbin = any(c.startswith("--xclbin-name=") for c in fixed)
+        has_insts = any(c.startswith("--npu-insts-name=") for c in fixed)
+        if has_xclbin and "--get-xclbin" not in fixed:
+            idx = next(
+                i for i, c in enumerate(fixed) if c.startswith("--xclbin-name=")
+            )
+            fixed.insert(idx, "--get-xclbin")
+        if has_insts and "--get-npu-insts" not in fixed:
+            idx = next(
+                i for i, c in enumerate(fixed) if c.startswith("--npu-insts-name=")
+            )
+            fixed.insert(idx, "--get-npu-insts")
+        return fixed
+
+    if not hasattr(_base.ShellCompilationCommand, "_aiecc_patched"):
+        _orig_run = _base.ShellCompilationCommand.run
+
+        def _patched_run(self):
+            if hasattr(self, "command") and isinstance(self.command, list):
+                if self.command and "aiecc" in self.command[0]:
+                    self.command = _fix_cmd(self.command)
+                    xrt_bin = "/opt/xilinx/xrt/bin"
+                    if hasattr(self, "env") and isinstance(self.env, dict):
+                        path_val = self.env.get("PATH", "")
+                        if xrt_bin not in path_val:
+                            self.env["PATH"] = xrt_bin + ":" + path_val
+            return _orig_run(self)
+
+        _base.ShellCompilationCommand.run = _patched_run
+        _base.ShellCompilationCommand._aiecc_patched = True
+
+
+_patch_for_1_4_0()
+
 RESET_DEVICE = "reset_device"
 
 

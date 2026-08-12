@@ -29,6 +29,7 @@ class MHA(MLIROperator):
     num_KV_heads: int
     num_of_pipelines: int = field(default=1, repr=False)
     context: object = field(default=None, repr=False)
+    seq_len_kv: int = 0  # S_kv for decode: defaults to seq_len if 0
 
     _name_aliases: ClassVar[Dict[str, str]] = {
         **MLIROperator._name_aliases,
@@ -40,8 +41,6 @@ class MHA(MLIROperator):
     def __post_init__(self):
         self.B_q = 64
         self.B_kv = 64
-        if self.d != 64:
-            raise ValueError(f"Only d=64 is supported in this version, got d={self.d}")
         MLIROperator.__init__(self, context=self.context)
 
     def get_mlir_artifact(self):
@@ -55,7 +54,7 @@ class MHA(MLIROperator):
                     "dev": aie_utils.DefaultNPURuntime.device(),
                     "heads": self.num_heads,
                     "S_q": self.seq_len,
-                    "S_kv": self.seq_len,
+                    "S_kv": self.seq_len_kv if self.seq_len_kv else self.seq_len,
                     "d": self.d,
                     "B_q": self.B_q,
                     "B_kv": self.B_kv,
@@ -74,6 +73,9 @@ class MHA(MLIROperator):
             self.context.base_dir / "aie_kernels" / "aie2p" / "softmax.cc"
         )
         mha_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mha.cc")
+        rope_source = str(
+            self.context.base_dir / "aie_kernels" / "aie2p" / "rope.cc"
+        )
         passthrough_source = str(
             self.context.base_dir / "aie_kernels" / "generic" / "passThrough.cc"
         )
@@ -83,14 +85,20 @@ class MHA(MLIROperator):
             f"-DDIM_M={self.B_q}",
             f"-DDIM_K={self.d}",
             f"-DDIM_N={self.B_kv}",
+            f"-DDIM_M_PV={self.B_q}",
+            f"-DDIM_K_PV={self.B_kv}",
+            f"-DDIM_N_PV={self.d}",
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
         mm_defines_colmaj = mm_defines_rowmaj + [
             "-DB_COL_MAJ",
         ]
-        # mha.cc #includes softmax.cc and mm.cc (both col-major and row-major)
-        # directly, so everything is compiled into a single mha.o translation unit.
+        # mha.cc #includes softmax.cc and mm.cc directly,
+        # so everything is compiled into a single mha.o translation unit.
+        # In OperatorSequence, _collect_kernel_artifacts() will prefix
+        # the filename (mha.o → op{idx}_mha.o) and symbols (via objcopy).
+        # design.py uses func_prefix to match the prefixed names in MLIR.
         return [
             KernelObjectArtifact(
                 "mha.o",
@@ -99,6 +107,7 @@ class MHA(MLIROperator):
                     SourceArtifact(mha_source),
                     SourceArtifact(mm_source),
                     SourceArtifact(softmax_source),
+                    SourceArtifact(rope_source),
                 ],
             ),
             KernelObjectArtifact(
@@ -108,23 +117,25 @@ class MHA(MLIROperator):
             ),
         ]
 
-    def get_artifacts(self):
-        return super().get_artifacts(dynamic_obj_fifos=True)
+    def get_artifacts(self, prefix: str = "", dynamic_obj_fifos: bool = True):
+        return super().get_artifacts(prefix=prefix, dynamic_obj_fifos=dynamic_obj_fifos)
 
     def get_arg_spec(self):
         seq_padding = self._calculate_seq_padding(self.seq_len, self.num_of_pipelines)
         buffer_size = self.num_heads * self.d * seq_padding
+        kv_data_size = self.num_KV_heads * self.d * seq_padding
         return [
             AIERuntimeArgSpec("in", (buffer_size,)),  # Q
-            AIERuntimeArgSpec("in", (buffer_size,)),  # K
-            AIERuntimeArgSpec("in", (buffer_size,)),  # V
+            AIERuntimeArgSpec("in", (kv_data_size,)),  # K
+            AIERuntimeArgSpec("in", (kv_data_size,)),  # V
             AIERuntimeArgSpec("out", (buffer_size,)),  # O
         ]
 
     def _calculate_seq_padding(self, seq_len, num_pipeline=1):
-        return ((seq_len + 63 * num_pipeline) // (64 * num_pipeline)) * (
+        pad = ((seq_len + 63 * num_pipeline) // (64 * num_pipeline)) * (
             64 * num_pipeline
         )
+        return max(pad, 64 * num_pipeline)  # minimum one tile per pipeline
 
     def _pad_to_multiple_of_64(self, tensor, seq_dim, num_pipeline=1):
         seq_len = tensor.shape[seq_dim]

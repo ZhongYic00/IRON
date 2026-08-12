@@ -12,16 +12,20 @@ from iron.common.test_utils import run_test
 def get_params():
     # (seq_len, head_dim, heads, number_of_pipeline, num_kv_heads)
     # Constraints (from design.py):
-    #   - head_dim must be 64
+    #   - head_dim must be 64 or 128 (multiple of 8)
     #   - num_kv_heads == 0 means standard MHA (treated as num_kv_heads == num_heads internally)
     #   - For GQA: 0 < num_kv_heads < num_heads, and num_heads % num_kv_heads == 0
     #   - number_of_pipelines determines how many AIE tile columns are used (col=0..N-1)
     return [
         # Standard MHA configuration (default suite)
         pytest.param(16384, 64, 1, 8, 0),
+        # d=128 standard MHA (Qwen3-0.6B: n_head=16, n_kv_head=8, hidden=1024 → head_dim=128)
+        pytest.param(16384, 128, 1, 8, 0),
         # GQA configuration: 8 query heads with 2 KV heads (group factor = 4)
         # num_heads=8, num_KV_heads=2 satisfies: 8 % 2 == 0 and 2 < 8
         pytest.param(16384, 64, 8, 8, 2, marks=pytest.mark.extensive),
+        # d=128 GQA: 8 query heads with 2 KV heads
+        pytest.param(16384, 128, 8, 8, 2, marks=pytest.mark.extensive),
         # Multi-pipeline variant with 4 pipelines instead of 8
         # Uses fewer AIE columns; seq_len=16384, standard MHA (num_kv_heads=0)
         pytest.param(16384, 64, 1, 4, 0, marks=pytest.mark.extensive),

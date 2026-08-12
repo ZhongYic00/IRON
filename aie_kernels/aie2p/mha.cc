@@ -9,6 +9,7 @@
 // PeanoCompilationRule configuration for this file.
 // mm.cc provides: matmul_bf16_bf16, matmul_scalar_bf16_bf16, zero_bf16, etc.
 #include "mm.cc"
+#include "rope.cc"
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
@@ -20,30 +21,47 @@
 
 #define ROUNDING_MODE aie::rounding_mode::conv_even
 
-// Row-major variants needed by matmul_PV.  Because there is no separate link
-// step, all kernel symbols must be defined in this single translation unit.
-// mm.cc's templates are already available (included above); we instantiate
-// them here with b_row_maj=true and expose the results as extern "C" symbols.
+// PV matmul dimensions: O = P @ V^T where P is (B_q, B_kv) and V is (d, B_kv).
+// DIM_M_PV = B_q (rows), DIM_K_PV = B_kv (contraction), DIM_N_PV = d (output cols).
+// These default to the QK dimensions when d == B_kv (backward compatible).
+#ifndef DIM_M_PV
+#define DIM_M_PV DIM_M
+#endif
+#ifndef DIM_K_PV
+#define DIM_K_PV DIM_N
+#endif
+#ifndef DIM_N_PV
+#define DIM_N_PV DIM_K
+#endif
+
+// PV matmul variant.  Because there is no separate link step, all kernel
+// symbols must be defined in this single translation unit.  mm.cc's templates
+// are already available (included above); we instantiate them here with
+// b_row_maj=true (row-major B) and expose the results as extern "C" symbols.
+// The v_dims streaming pattern in design.py transposes V from (d, B_kv) to
+// (B_kv, d) = (DIM_K_PV, DIM_N_PV) during DMA, so b_row_maj=true is correct.
 extern "C" {
 
-void zero_bf16_rowmaj(bfloat16 *c_out)
+void zero_bf16_pv(bfloat16 *c_out)
 {
-    zero_vectorized<bfloat16, DIM_M, DIM_N>(c_out);
+    zero_vectorized<bfloat16, DIM_M_PV, DIM_N_PV>(c_out);
 }
 
-void matmul_bf16_bf16_rowmaj(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out)
+void matmul_bf16_bf16_pv(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    // Explicitly instantiate with b_row_maj=true (row-major B), c_row_maj=true.
+    // PV matmul: O = P @ V^T where P is (B_q, B_kv) and V is stored as (d, B_kv).
+    // The v_dims DMA pattern transposes V to (B_kv, d) = (DIM_K_PV, DIM_N_PV)
+    // row-major, so b_row_maj=true correctly computes P @ V^T.
     constexpr unsigned r = 8, s = 8, t = 8;
-    static_assert(DIM_M % (2 * r) == 0);
-    static_assert(DIM_K % s == 0);
-    static_assert(DIM_N % (2 * t) == 0);
+    static_assert(DIM_M_PV % (2 * r) == 0);
+    static_assert(DIM_K_PV % s == 0);
+    static_assert(DIM_N_PV % (2 * t) == 0);
     matmul_vectorized_2x2_mmul<bfloat16,
                                bfloat16,
-                               (DIM_M / r),
-                               (DIM_K / s),
-                               (DIM_N / t),
+                               (DIM_M_PV / r),
+                               (DIM_K_PV / s),
+                               (DIM_N_PV / t),
                                r,
                                s,
                                t,
@@ -112,16 +130,16 @@ void matmul_PV(bfloat16 *Q,
                 bfloat16 scale_val = scale_row[k];
                 Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
 
-                for (int32_t j = 0; j < 8; j++) {
-                    Vec8bf16 o_vec = aie::load_v<8>(out + j * 64 + k * 8 + l * 512);
+                for (int32_t j = 0; j < (DIM_N_PV / 8); j++) {
+                    Vec8bf16 o_vec = aie::load_v<8>(out + j * 64 + k * 8 + l * (DIM_N_PV * 8));
                     o_vec = aie::mul(o_vec, scale_vec);
-                    aie::store_v(out + j * 64 + k * 8 + l * 512, o_vec);
+                    aie::store_v(out + j * 64 + k * 8 + l * (DIM_N_PV * 8), o_vec);
                 }
             }
         }
     }
 
-    matmul_bf16_bf16_rowmaj(Q, K, out);
+    matmul_bf16_bf16_pv(Q, K, out);
 }
 
 void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_buffer)
@@ -151,10 +169,10 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
             bfloat16 scale_val = scale_row[k];
             Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
 
-            for (int32_t j = 0; j < 8; j++) {
-                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 512);
+            for (int32_t j = 0; j < (DIM_N_PV / 8); j++) {
+                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * (DIM_N_PV * 8));
                 o_vec = aie::mul(o_vec, scale_vec);
-                aie::store_v(O + j * 64 + k * 8 + l * 512, o_vec);
+                aie::store_v(O + j * 64 + k * 8 + l * (DIM_N_PV * 8), o_vec);
             }
         }
     }
@@ -305,8 +323,12 @@ void init_scale_buffer(bfloat16 *scale_buffer, int32_t size)
         aie::store_v(scale_buffer + i, lowest_vec);
         // VJUNG: m_{i} vector
         aie::store_v(scale_buffer + size + i, zeros_vec);
-        // VJUNG: l_{i} vector
-        aie::store_v(scale_buffer + 2 * size + i, zeros_vec);
+        // VJUNG: l_{i} vector — initialized to 1.0 (not 0.0) to avoid
+        // NaN from 1/l_i = inf in padding rows (where softmax is skipped
+        // and l_i is never updated). With l_i=1, rescale_O computes
+        // o_vec * inv(1) = o_vec * 1.0 = o_vec (no-op for padding rows).
+        Vec64bf16 ones_vec = aie::broadcast<bfloat16, VECTOR_LENGTH>((bfloat16)1.0);
+        aie::store_v(scale_buffer + 2 * size + i, ones_vec);
     }
 }
 }

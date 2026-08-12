@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import os
+import sys
 from pathlib import Path
 
 from ml_dtypes import bfloat16
@@ -16,12 +18,85 @@ from aie.iron import (
     Runtime,
     Worker,
     WorkerRuntimeBarrier,
+    TaskGroup,
     str_to_dtype,
 )
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
-from iron.operators._trace import maybe_enable_trace
+from iron.operators._trace import resolve_trace_size
+
+# ---------------------------------------------------------------------------
+# mlir-aie 1.4.0 aiecc compatibility shim
+#
+# IRON's compilation rules emit flags (--no-compile-host,
+# --aie-generate-xclbin, --aie-generate-npu-insts) that the 1.4.0 wheel's
+# aiecc does not recognise. The 1.4.0 driver uses a graph-cut model:
+# request outputs with --get-xclbin / --get-npu-insts and supply
+# --xclbin-name / --npu-insts-name for the filenames.
+#
+# This shim patches ShellCompilationCommand.run to fix the command list
+# right before the aiecc subprocess is launched. It is a no-op on newer
+# mlir-aie versions (the stripped flags are simply absent; --get-* are
+# supported by the newer driver too).
+# ---------------------------------------------------------------------------
+_aiecc_compat_done = False
+
+
+def _patch_aiecc_for_1_4_0():
+    global _aiecc_compat_done
+    if _aiecc_compat_done:
+        return
+    _aiecc_compat_done = True
+
+    import iron.common.compilation.base as _base
+
+    _REMOVE_FLAGS = {
+        "--no-compile-host",
+        "--aie-generate-xclbin",
+        "--aie-generate-npu-insts",
+        "--no-compile",
+    }
+
+    def _fix_cmd(cmd_list):
+        """Strip 1.4.0-incompatible flags and add --get-* shorthands."""
+        fixed = [c for c in cmd_list if c not in _REMOVE_FLAGS]
+        has_xclbin = any(c.startswith("--xclbin-name=") for c in fixed)
+        has_insts = any(c.startswith("--npu-insts-name=") for c in fixed)
+        if has_xclbin and "--get-xclbin" not in fixed:
+            idx = next(
+                i for i, c in enumerate(fixed) if c.startswith("--xclbin-name=")
+            )
+            fixed.insert(idx, "--get-xclbin")
+        if has_insts and "--get-npu-insts" not in fixed:
+            idx = next(
+                i for i, c in enumerate(fixed) if c.startswith("--npu-insts-name=")
+            )
+            fixed.insert(idx, "--get-npu-insts")
+        return fixed
+
+    # Patch ShellCompilationCommand.run — this is called right before the
+    # aiecc subprocess is launched, so the command list is fixed here
+    # regardless of which CompilationRule created it.
+    _orig_run = _base.ShellCompilationCommand.run
+
+    def _patched_run(self):
+        if hasattr(self, "command") and isinstance(self.command, list):
+            # Only fix aiecc commands
+            if self.command and "aiecc" in self.command[0]:
+                self.command = _fix_cmd(self.command)
+                # Ensure xclbinutil is on PATH (needed for --get-xclbin)
+                xrt_bin = "/opt/xilinx/xrt/bin"
+                if hasattr(self, "env") and isinstance(self.env, dict):
+                    path_val = self.env.get("PATH", "")
+                    if xrt_bin not in path_val:
+                        self.env["PATH"] = xrt_bin + ":" + path_val
+        return _orig_run(self)
+
+    _base.ShellCompilationCommand.run = _patched_run
+
+
+_patch_aiecc_for_1_4_0()
 
 microkernel_mac_dim_map = {
     "npu1": {
@@ -550,29 +625,44 @@ def my_matmul(
             prune_step=False,
         )
 
-    # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
-        maybe_enable_trace(rt, trace_size, workers)
-        rt.start(*workers)
+    # Create shim DMA handles with tile placement for runtime fills/drains.
+    # In mlir-aie 1.4.0, the tile is set on the handle (prod/cons) rather
+    # than per fill/drain call.
+    A_prod_handles = []
+    for col in range(n_shim_mem_A):
+        tile_col = 2 * col if n_aie_cols == 8 else col
+        A_prod_handles.append(A_l3l2_fifos[col].prod(tile=Tile(tile_col, 0)))
 
-        # Set runtime parameters
-        def set_rtps(*args):
-            for row, rtps_row in enumerate(args):
-                for col, rtp_row_col in enumerate(rtps_row):
-                    rtp_row_col[0] = K_div_k
-                    rtp_row_col[1] = n_c_row_tiles_per_core * n_c_col_tiles_per_core
+    B_prod_handles = []
+    C_cons_handles = []
+    for col in range(n_aie_cols):
+        B_prod_handles.append(B_l3l2_fifos[col].prod(tile=Tile(col, 0)))
+        C_cons_handles.append(C_l2l3_fifos[col].cons(tile=Tile(col, 0)))
 
-        rt.inline_ops(set_rtps, rtps)
+    rt_handles = [A_prod_handles, B_prod_handles, C_cons_handles]
 
-        # Set the barriers to 1 to allow the worker to read the
-        # runtime parameters and start the computation
+    # Runtime sequence body — runs at resolve time inside the runtime_sequence op.
+    # In mlir-aie 1.4.0, Runtime takes (seq_fn, fn_args) where fn_args entries
+    # that are types become RuntimeData (fill/drain targets) and other objects
+    # pass through to the body unchanged.
+    def seq_fn(A, B, C, handles):
+        h_A_prod, h_B_prod, h_C_cons = handles
+
+        # Set runtime parameters (was rt.inline_ops)
         for row in range(n_aie_rows):
             for col in range(n_aie_cols):
-                rt.set_barrier(workerBarriers[row][col], 1)
+                rtps[row][col][0] = K_div_k
+                rtps[row][col][1] = n_c_row_tiles_per_core * n_c_col_tiles_per_core
+
+        # Set barriers to release workers (was rt.set_barrier)
+        for row in range(n_aie_rows):
+            for col in range(n_aie_cols):
+                workerBarriers[row][col].set(1)
+
+        # Workers start automatically — no rt.start() needed in 1.4.0.
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
-        tg = rt.task_group()
+        tg = TaskGroup()
         for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
             for pingpong in [0, 1]:
                 row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
@@ -630,13 +720,11 @@ def my_matmul(
                         # This line does not change MLIR output at all - it's just for recording data movement
                         C_taps.append(C_tile)
 
-                        rt.drain(
-                            C_l2l3_fifos[col].cons(),
+                        h_C_cons[col].drain(
                             C,
                             tap=C_tile,
                             wait=True,
-                            task_group=tg,
-                            tile=Tile(col, 0),
+                            group=tg,
                         )
 
                     for tile_row in range(current_tb_n_rows):
@@ -685,13 +773,11 @@ def my_matmul(
                                 sizes=C_sizes,
                                 strides=C_strides,
                             )
-                            rt.drain(
-                                C_l2l3_fifos[col].cons(),
+                            h_C_cons[col].drain(
                                 C,
                                 tap=C_tile,
                                 wait=True,
-                                task_group=tg,
-                                tile=Tile(col, 0),
+                                group=tg,
                             )
                             # This line does not change MLIR output at all - it's just for recording data movement
                             C_taps.append(C_tile)
@@ -719,15 +805,11 @@ def my_matmul(
                         ) % len(A_tiles)
 
                         # always equal to n_aie_rows since we have n_aie_rows row tiles for matrix A
-                        if col < n_aie_rows:
-                            rt.fill(
-                                A_l3l2_fifos[col].prod(),
+                        if col < n_shim_mem_A:
+                            h_A_prod[col].fill(
                                 A,
                                 tap=A_tiles[tile_offset],
-                                task_group=tg,
-                                tile=Tile(
-                                    2 * col if n_aie_cols == 8 else col, 0
-                                ),  # alternate columns in full 4x8 NPU2 case
+                                group=tg,
                             )
                         # Use the calculated sizes/strides/offsets to record the data movement
                         # caused by the above call to npu_dma_memcpy_nd.
@@ -751,21 +833,40 @@ def my_matmul(
                         #     |0011    0011    |
                         #     |0011    0011    |
                         #      ----------------
-                        rt.fill(
-                            B_l3l2_fifos[col].prod(),
+                        h_B_prod[col].fill(
                             B,
                             tap=B_tiles[col],
-                            task_group=tg,
-                            tile=Tile(col, 0),
+                            group=tg,
                         )
 
                         # These lines do not change MLIR output at all - they are just for recording data movement
                         A_taps.append(A_tiles[tile_offset])
                         B_taps.append(B_tiles[col])
                 if tb > 0 or (tb == 0 and pingpong > 0):
-                    rt.finish_task_group(tg)
-                    tg = rt.task_group()
-        rt.finish_task_group(tg)
+                    tg.finish()
+                    tg = TaskGroup()
+        tg.finish()
+
+    # Create the runtime with the sequence function and fn_args.
+    # fn_args: type entries (A_ty, B_ty, C_ty) become RuntimeData;
+    # the rt_handles list passes through and its ObjectFifoHandles are registered.
+    rt = Runtime(seq_fn, [A_ty, B_ty, C_ty, rt_handles])
+
+    # Create the program from the device type, runtime, and workers.
+    # In 1.4.0, workers are passed to Program (not started from Runtime).
+    my_program = Program(dev_ty, rt, workers=workers)
+
+    # Enable trace on Program if requested.
+    ts = resolve_trace_size(trace_size)
+    if ts > 0:
+        ntiles = max(0, int(os.environ.get("IRON_TRACE_NTILES", "1")))
+        my_program.enable_trace(
+            ts,
+            workers=list(workers)[:ntiles],
+        )
+
+    # Place components (assign them resources on the device) and generate an MLIR module
+    module = my_program.resolve_program()
 
     if generate_taps:
         # If generate taps is true, return a representation of tensor access patterns
@@ -776,11 +877,6 @@ def my_matmul(
             TensorAccessSequence.from_taps(C_taps),
         )
 
-    # Create the program from the device type and runtime
-    my_program = Program(dev_ty, rt)
-
-    # Place components (assign them resources on the device) and generate an MLIR module
-    module = my_program.resolve_program()
     return module
 
 
