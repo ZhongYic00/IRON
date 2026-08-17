@@ -388,29 +388,17 @@ def fused_mha(
     k_dims = None
     if vectorized:
         k_dims = [(B_kv // t, t * d), (d // s, s), (t, d), (s, 1)]
-    if number_of_pipelines == 1:
-        # Decode: direct shim→core via core tile forward (no mem tile)
-        # depth=2 on inK to hold cos/sin + K data for time-multiplexed RoPE
-        # forward on core tile does dims_to_stream reshape
-        inK = ObjectFifo(k_ty, name="inK", depth=2)
-        memK = inK.cons().forward(
-            name="memK",
-            dims_to_stream=k_dims,
-            depth=1,  # depth 1 on core tile (small L1)
-        )
-    else:
-        # Prefill: shim→mem→core broadcast (original path)
-        inK = ObjectFifo(
-            k_ty,
-            name="inK",
-            depth=of_depth,
-        )
-        memK = inK.cons().forward(
-            name="memK",
-            dims_to_stream=k_dims,
-            tile=Tile(col=3, row=1),
-            depth=pv_depth,
-        )  # Broadcast, give this handle to N pipelines
+    inK = ObjectFifo(
+        k_ty,
+        name="inK",
+        depth=of_depth,
+    )
+    memK = inK.cons().forward(
+        name="memK",
+        dims_to_stream=k_dims,
+        tile=Tile(col=3, row=1),
+        depth=pv_depth,
+    )  # Broadcast, give this handle to N pipelines
 
     v_dims = None
     if vectorized:
@@ -418,25 +406,17 @@ def fused_mha(
         # PV matmul which uses b_row_maj=true with DIM_K_PV=B_kv, DIM_N_PV=d.
         v_dims = [(B_kv // t, t * d), (d // s, s), (t, d), (s, 1)]
 
-    if number_of_pipelines == 1:
-        inV = ObjectFifo(k_ty, name="inV", depth=of_depth)
-        memV = inV.cons().forward(
-            name="memV",
-            dims_to_stream=v_dims,
-            depth=1,
-        )
-    else:
-        inV = ObjectFifo(
-            k_ty,
-            name="inV",
-            depth=of_depth,
-        )
-        memV = inV.cons().forward(
-            name="memV",
-            dims_to_stream=v_dims,
-            tile=Tile(col=4, row=1),
-            depth=pv_depth,
-        )  # Broadcast, give this handle to N pipelines
+    inV = ObjectFifo(
+        k_ty,
+        name="inV",
+        depth=of_depth,
+    )
+    memV = inV.cons().forward(
+        name="memV",
+        dims_to_stream=v_dims,
+        tile=Tile(col=4, row=1),
+        depth=pv_depth,
+    )  # Broadcast, give this handle to N pipelines
 
     a_dims = None
     if vectorized:
