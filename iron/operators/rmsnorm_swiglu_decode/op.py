@@ -35,16 +35,14 @@ class RMSNormSwiGLUDecode(OperatorSequence):
         dev = aie_utils.get_current_device()
         n_cols = get_shim_dma_limit(dev) // 2
 
-        # RMSNorm: x → RMSNorm(x, gamma), size=embedding_dim
+        # RMSNorm: x → RMSNorm(x), unweighted (gamma folded into gate/up weights)
         # Use tile_size=embedding_dim so the entire vector fits in one tile.
-        # This makes the input buffer size = embedding_dim (1024 bf16),
-        # matching what GEMV expects as input.
         rmsnorm = RMSNorm(
             size=embedding_dim,
             num_aie_columns=1,
             num_channels=1,
-            tile_size=embedding_dim,  # full vector in one tile
-            weighted=True,  # with gamma weight
+            tile_size=embedding_dim,
+            weighted=False,  # bare RMSNorm — gamma pre-multiplied into weights
             epsilon=epsilon,
         )
 
@@ -74,11 +72,11 @@ class RMSNormSwiGLUDecode(OperatorSequence):
         )
 
         runlist = [
-            # RMSNorm: in → normed (with weight w_rmsnorm)
-            (rmsnorm, "w_rmsnorm", "in", "normed"),
-            # gate GEMV: W_gate @ normed → left
+            # Bare RMSNorm (unweighted): in → normed (no gamma, gamma is in weights)
+            (rmsnorm, "in", "normed"),
+            # gate GEMV: W_gate' @ normed → left (W_gate' = W_gate * gamma, pre-baked)
             (gemv_1, "w_gate", "normed", "left"),
-            # up GEMV: W_up @ normed → right
+            # up GEMV: W_up' @ normed → right (W_up' = W_up * gamma, pre-baked)
             (gemv_1, "w_up", "normed", "right"),
             # SiLU(gate) → left_swished
             (silu, "left", "left_swished"),
