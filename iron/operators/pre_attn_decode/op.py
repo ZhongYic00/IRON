@@ -73,15 +73,33 @@ class PreAttentionDecode(OperatorSequence):
             tile_size_output=qkv_dim // n_cols,
         )
 
+        # Fused QK-norm + RoPE + V-copy
+        # Input: qkv_out (4096) = [Q(16×128) | K(8×128) | V(8×128)]
+        # Q and K: per-head RMSNorm + RoPE
+        # V: direct copy (no norm, no RoPE)
+        q_heads = 16
+        kv_heads = 8
+        from iron.operators.qk_norm_rope.op import QKNormRoPE
+        qk_norm_rope = QKNormRoPE(
+            qkv_dim=qkv_dim,
+            head_dim=head_dim,
+            n_qk_heads=q_heads + kv_heads,  # 24 (Q + K)
+            n_v_heads=kv_heads,             # 8
+            epsilon=epsilon,
+        )
+
         runlist = [
             (rmsnorm, "in", "normed"),
             (gemv_qkv, "w_qkv", "normed", "qkv_out"),
+            # Fused QK-norm + RoPE: qkv_out → qkv_rope
+            # scratch = merged [w_qk_gamma | w_cos_sin] to fit 2 MM2S channels
+            (qk_norm_rope, "qkv_out", "qkv_rope", "w_scratch"),
         ]
 
         super().__init__(
             name=f"pre_attn_decode_e{embedding_dim}_q{qkv_dim}",
             runlist=runlist,
             input_args=["in"],
-            output_args=["qkv_out"],
+            output_args=["qkv_rope"],
             context=context,
         )
