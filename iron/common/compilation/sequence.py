@@ -310,7 +310,7 @@ def _patch_for_1_4_0():
         "--aie-generate-xclbin",
         "--aie-generate-npu-insts",
         "--no-compile",
-        "--generate-full-elf",  # 1.4.0 uses --full-elf-name= directly
+        "--generate-full-elf",  # 1.4.0 aiecc doesn't support this flag
     }
 
     def _fix_cmd(cmd_list):
