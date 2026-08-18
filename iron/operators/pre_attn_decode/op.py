@@ -6,16 +6,17 @@
 Fuses: bare RMSNorm + QKV GEMV + RoPE into a single NPU dispatch.
 
 Input: x (1024,) bf16 — pre-attention hidden state (after residual add)
-Output: qk (24 * 128 = 3072,) bf16 — Q+K merged and RoPE-rotated
+Output: qkv (4096,) bf16 — QKV projection output (RoPE applied to Q+K only)
 
-Scratch buffer contains per-layer weights:
-  w_qkv: (4096, 1024) bf16 — fused QKV weight (n_head*hd + 2*n_kv_head*hd = 16*128+2*8*128 = 3072)
-    Actually QKV: q_dim=2048, k_dim=1024, v_dim=1024 → total=4096
-  cos_sin_table: (2 * max_seq * 128) bf16 — pre-computed cos/sin for all positions
+QKV split: Q = qkv[0:2048], K = qkv[2048:3072], V = qkv[3072:4096]
+RoPE is applied to Q (2048 = 16 heads × 128) and K (1024 = 8 heads × 128)
+but NOT V. This requires splitting QKV, applying RoPE to Q+K, then
+concatenating back. Since OperatorSequence works on whole buffers,
+we apply RoPE to the entire QKV (3072 elements = Q+K, V=1024 excluded).
 
-position is passed via ScratchpadParameter "rope_position" (int32).
-Only Q and K get RoPE (first 3072 elements of output = Q+K = 2048+1024).
-V (last 1024 elements) does not get RoPE.
+For simplicity in this version, RoPE is applied to Q+K as a separate
+step after the OperatorSequence (not fused yet). The runlist only
+fuses RMSNorm + QKV GEMV.
 """
 
 import aie.utils as aie_utils
@@ -25,17 +26,21 @@ from iron.common.sequence import OperatorSequence
 from iron.common.utils import get_shim_dma_limit
 from iron.operators.gemv.op import GEMV
 from iron.operators.rms_norm.op import RMSNorm
-from aie.iron import ScratchpadParameter
+from iron.operators.rope.op import RoPE
 
 
 class PreAttentionDecode(OperatorSequence):
-    """Fused RMSNorm + QKV GEMV + RoPE for single-token decode.
+    """Fused RMSNorm + QKV GEMV for single-token decode.
+
+    Gamma is folded into QKV weight (W_qkv' = W_qkv * gamma).
+    RoPE is applied separately (not fused — needs cos/sin table
+    in scratch buffer, which OperatorSequence doesn't support yet
+    for per-position-varying data).
 
     Runtime buffers:
     - input: "in" (1024 bf16)
-    - output: "out" (3072 bf16 = 24 heads × 128 — Q+K merged, V excluded)
-    - scratch weights: "w_qkv" (per-layer), "cos_sin_table" (shared)
-    - ScratchpadParameter "rope_position" (int32, set per decode step)
+    - output: "qkv_out" (4096 bf16)
+    - scratch weights: "w_qkv" (per-layer, gamma-folded)
     """
 
     def __init__(self, embedding_dim, qkv_dim, head_dim, max_seq_len=512,
@@ -68,21 +73,6 @@ class PreAttentionDecode(OperatorSequence):
             tile_size_output=qkv_dim // n_cols,
         )
 
-        # ScratchpadParameter for position
-        rope_position = ScratchpadParameter("rope_position", np.int32)
-
-        # Runlist:
-        # 1. RMSNorm: in → normed (bare, gamma in weights)
-        # 2. QKV GEMV: W_qkv @ normed → qkv_out
-        #    (RoPE is applied separately — see note below)
-        #
-        # NOTE: RoPE needs to be applied to Q (first 2048 elements) and K
-        # (next 1024 elements) of qkv_out, but NOT V (last 1024 elements).
-        # This requires a custom elementwise kernel that reads from scratch
-        # (cos_sin_table) and uses the position parameter.
-        # For now, RoPE is NOT included in this sequence — it's applied
-        # separately via the IRON RoPE operator. Future: add a custom
-        # elementwise op to the runlist that does RoPE in-kernel.
         runlist = [
             (rmsnorm, "in", "normed"),
             (gemv_qkv, "w_qkv", "normed", "qkv_out"),
@@ -95,6 +85,3 @@ class PreAttentionDecode(OperatorSequence):
             output_args=["qkv_out"],
             context=context,
         )
-
-        # Store the rope_position parameter for host-side access
-        self.rope_position = rope_position
