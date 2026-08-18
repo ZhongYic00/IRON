@@ -310,11 +310,18 @@ def _patch_for_1_4_0():
         "--aie-generate-xclbin",
         "--aie-generate-npu-insts",
         "--no-compile",
-        "--generate-full-elf",  # 1.4.0 aiecc doesn't support this flag
     }
 
     def _fix_cmd(cmd_list):
+        """Fix aiecc command for 1.4.0 compatibility:
+        - Replace --generate-full-elf with --get-full-elf (1.4.0 syntax)
+        - Convert --full-elf-name <path> to --full-elf-name=<path>
+        - Remove flags not supported by 1.4.0 aiecc
+        - Ensure /opt/xilinx/xrt/bin is on PATH for aiebu-asm
+        """
         fixed = [c for c in cmd_list if c not in _REMOVE_FLAGS]
+        # Replace --generate-full-elf with --get-full-elf
+        fixed = ["--get-full-elf" if c == "--generate-full-elf" else c for c in fixed]
         # Convert "--full-elf-name <path>" to "--full-elf-name=<path>"
         for i, c in enumerate(fixed):
             if c == "--full-elf-name" and i + 1 < len(fixed):

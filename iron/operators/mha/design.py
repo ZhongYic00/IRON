@@ -20,7 +20,6 @@ from aie.iron import (
     Buffer,
     WorkerRuntimeBarrier,
     TaskGroup,
-    ScratchpadParameter,
 )
 from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
@@ -61,8 +60,18 @@ def _patch_aiecc_for_1_4_0():
     }
 
     def _fix_cmd(cmd_list):
-        """Strip 1.4.0-incompatible flags and add --get-* shorthands."""
+        """Strip 1.4.0-incompatible flags and add --get-* shorthands.
+        Also convert --generate-full-elf to --get-full-elf (1.4.0 syntax)
+        and --full-elf-name <path> to --full-elf-name=<path>."""
         fixed = [c for c in cmd_list if c not in _REMOVE_FLAGS]
+        # Replace --generate-full-elf with --get-full-elf (1.4.0 syntax)
+        fixed = ["--get-full-elf" if c == "--generate-full-elf" else c for c in fixed]
+        # Convert "--full-elf-name <path>" to "--full-elf-name=<path>"
+        for i, c in enumerate(fixed):
+            if c == "--full-elf-name" and i + 1 < len(fixed):
+                fixed[i] = f"--full-elf-name={fixed[i + 1]}"
+                fixed[i + 1] = None
+        fixed = [c for c in fixed if c is not None]
         has_xclbin = any(c.startswith("--xclbin-name=") for c in fixed)
         has_insts = any(c.startswith("--npu-insts-name=") for c in fixed)
         if has_xclbin and "--get-xclbin" not in fixed:
@@ -343,12 +352,12 @@ def fused_mha(
     )
 
     # RoPE kernel — applies rotary position embedding to Q/K tiles in-place.
-    # Computes cos/sin on-core from position scalar + static inv_freq table.
-    # position is passed as an int32 arg (from ScratchpadParameter).
+    # With identity cos/sin (cos=1, sin=0) this is a no-op; the kernel's
+    # fast path detects identity and returns immediately.
     rope_kernel = Kernel(
-        f"{func_prefix}rope_qk_bf16_with_position",
+        f"{func_prefix}rope_qk_bf16",
         mha_obj,
-        [q_ty, k_ty, np.int32, np.int32, np.int32],
+        [q_ty, k_ty, np.ndarray[(d,), np.dtype[dtype]], np.ndarray[(d,), np.dtype[dtype]], np.int32, np.int32],
     )
 
     # AIE-array data movement with object fifos
@@ -495,7 +504,8 @@ def fused_mha(
         zero,
         matmul_QK,
         rope,
-        rope_pos,
+        cos_buf,
+        sin_buf,
         q_block_bias,
         mha_rtps,
         barrier,
@@ -521,10 +531,8 @@ def fused_mha(
                     elem_in_k = of_k.acquire(1)
                     elem_a_out = of_a_out.acquire(1)
 
-                    # Apply RoPE to Q/K tiles before matmul.
-                    # cos/sin computed on-core from position (no external DMA needed).
-                    position = rope_pos.read()
-                    rope(elem_in_q, elem_in_k, position, B_q, d)
+                    # Apply RoPE to Q/K tiles before matmul (no-op with identity cos/sin).
+                    rope(elem_in_q, elem_in_k, cos_buf, sin_buf, B_q, d)
 
                     zero(elem_a_out)
                     matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
@@ -728,11 +736,20 @@ def fused_mha(
         for j in range(3)
     ]
 
-    # ScratchpadParameter for RoPE position.
-    # Host sets this per decode step; AIE core reads it via scratchpad mechanism.
-    # The rope kernel uses position + static inv_freq table to compute cos/sin on-core,
-    # eliminating all external RoPE dispatches.
-    rope_position_param = ScratchpadParameter("rope_position", np.int32)
+    # Local L1 Buffers for cos/sin on each matmul worker tile.
+    # Identity values (cos=1, sin=0) make rope_kernel a no-op.
+    cos_bufs = [
+        Buffer(type=np.ndarray[(d,), np.dtype[dtype]], name=f"cos_l1_{i}",
+               initial_value=np.ones(d, dtype=dtype),
+               tile=Tile(col=i, row=2))
+        for i in range(number_of_pipelines)
+    ]
+    sin_bufs = [
+        Buffer(type=np.ndarray[(d,), np.dtype[dtype]], name=f"sin_l1_{i}",
+               initial_value=np.zeros(d, dtype=dtype),
+               tile=Tile(col=i, row=2))
+        for i in range(number_of_pipelines)
+    ]
 
     # Create worker from task
     matmul_workers = []
@@ -754,7 +771,8 @@ def fused_mha(
                     zero_kernel,
                     matmul_QK,
                     rope_kernel,
-                    rope_position_param,
+                    cos_bufs[i],
+                    sin_bufs[i],
                     i,
                     mha_rtps_list[0][i],
                     worker_barrier_list[0][i],
@@ -916,9 +934,6 @@ def fused_mha(
                 mha_rtps_list[j][i][2] = S_q_eff
                 mha_rtps_list[j][i][3] = S_kv_eff
 
-        # RoPE position is set via ScratchpadParameter (host-side, not in seq_fn).
-        # The --aie-lower-scratchpad-parameters pass inserts sync ops automatically.
-
         # Set barriers to release workers (was rt.set_barrier)
         for j in range(3):
             for i in range(number_of_pipelines):
@@ -1004,9 +1019,8 @@ def fused_mha(
                 tg.finish()
 
     # Create the runtime with the sequence function and fn_args.
-    # fn_args: type entries (Q_ty, KV_ty) become RuntimeData (fill/drain BOs);
+    # fn_args: type entries (Q_ty, KV_ty) become RuntimeData;
     # the rt_handles list passes through and its ObjectFifoHandles are registered.
-    # ScratchpadParameter (rope_position) is handled separately by the compiler.
     rt = Runtime(seq_fn, [Q_ty, KV_ty, KV_ty, Q_ty, rt_handles])
 
     # Create the program from the device type, runtime, and workers.
