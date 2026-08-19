@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// f32 GEMV with fused argmax: computes W @ x, outputs argmax index per column.
-// Each kernel call processes m_input rows and updates the running max in c_out.
-// c_out[0] = running max value, c_out[1] = running argmax index (as float).
-// On first call (row_offset == 0), c_out is initialized to [-inf, 0].
-// C ObjectFifo depth=1 ensures same buffer is reused across sub-tile calls.
+// f32 GEMV with fused argmax using persistent L1 Buffer for running max.
+// Each kernel call processes m_input rows, reads running max from rmax_buf,
+// updates it, and writes back. The design copies rmax_buf to output ObjectFifo
+// after all sub-tiles are processed.
 
 #define NOCPP
 
@@ -32,20 +31,20 @@ void matvec_argmax_vec(uint32_t m,
                        uint32_t row_offset,
                        const float *__restrict a,
                        const float *__restrict b,
-                       float *__restrict out)
+                       float *__restrict rmax)  // persistent L1 buffer [max_val, argmax_idx]
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     const float *b_end = b + k;
 
-    // Read running max from output buffer (or init on first call)
-    float local_max;
-    int32_t local_argmax;
+    // Read running max from persistent buffer
+    volatile float *rmax_v = rmax;
+    float local_max = rmax_v[0];
+    int32_t local_argmax = (int32_t)rmax_v[1];
+
+    // On first sub-tile (row_offset == 0), re-initialize
     if (row_offset == 0) {
         local_max = -1e30f;
         local_argmax = 0;
-    } else {
-        local_max = out[0];
-        local_argmax = (int32_t)out[1];
     }
 
     for (uint32_t row = 0; row < m; row++) {
@@ -63,9 +62,9 @@ void matvec_argmax_vec(uint32_t m,
         }
     }
 
-    // Write back updated running max
-    out[0] = local_max;
-    out[1] = (float)local_argmax;
+    // Write back to persistent buffer
+    rmax_v[0] = local_max;
+    rmax_v[1] = (float)local_argmax;
 }
 
 extern "C" {
@@ -75,9 +74,9 @@ void matvec_argmax_f32_f32(uint32_t m,
                            uint32_t row_offset,
                            const float *__restrict a_in,
                            const float *__restrict b_in,
-                           float *__restrict c_out)
+                           float *__restrict rmax_out)
 {
-    matvec_argmax_vec<VEC_SIZE, DIM_K>(m, col_offset, row_offset, a_in, b_in, c_out);
+    matvec_argmax_vec<VEC_SIZE, DIM_K>(m, col_offset, row_offset, a_in, b_in, rmax_out);
 }
 
 } // extern "C"
