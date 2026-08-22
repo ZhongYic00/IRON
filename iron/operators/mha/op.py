@@ -123,7 +123,12 @@ class MHA(MLIROperator):
     def get_arg_spec(self):
         seq_padding = self._calculate_seq_padding(self.seq_len, self.num_of_pipelines)
         buffer_size = self.num_heads * self.d * seq_padding
-        kv_data_size = self.num_KV_heads * self.d * seq_padding
+        # K/V buffers are sized by the KV cache length (seq_len_kv), not the
+        # query length.  design.py lays K/V out as (num_KV_heads, S_kv_pad * d)
+        # where S_kv_pad derives from seq_len_kv, so the arg spec must match.
+        kv_seq = self.seq_len_kv if self.seq_len_kv else self.seq_len
+        kv_padding = self._calculate_seq_padding(kv_seq, self.num_of_pipelines)
+        kv_data_size = self.num_KV_heads * self.d * kv_padding
         return [
             AIERuntimeArgSpec("in", (buffer_size,)),  # Q
             AIERuntimeArgSpec("in", (kv_data_size,)),  # K

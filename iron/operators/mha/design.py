@@ -20,9 +20,11 @@ from aie.iron import (
     Buffer,
     WorkerRuntimeBarrier,
     TaskGroup,
+    ScratchpadParameter,
 )
 from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
+from aie.iron.runtime.runtime import sync_parameters
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
 from aie.helpers.dialects.scf import if_, else_
 from iron.operators._trace import resolve_trace_size
@@ -555,6 +557,8 @@ def fused_mha(
         memcopy_kernel_scale,
         q_block_bias,
         mha_rtps,
+        seq_q_eff_param,
+        seq_kv_eff_param,
         barrier,
         idx_buffer,
         scale_buffer,
@@ -568,8 +572,11 @@ def fused_mha(
         loop_idx_q = mha_rtps[0]
         loop_idx_kv = mha_rtps[1]
 
-        S_q_effective = mha_rtps[2]
-        S_kv_effective = mha_rtps[3]
+        # S_q_eff / S_kv_eff are runtime sequence lengths written by the host
+        # each dispatch (scratchpad parameters); for decode S_kv_eff = seq_pos+1
+        # so the tail of the KV cache is masked off before softmax.
+        S_q_effective = seq_q_eff_param.read()
+        S_kv_effective = seq_kv_eff_param.read()
 
         for _ in range_(sys.maxsize):
 
@@ -736,6 +743,15 @@ def fused_mha(
         for j in range(3)
     ]
 
+    # Runtime sequence lengths, written by the host each dispatch via
+    # SequenceFullELFCallable.params (ParameterScratchpad).  For decode the
+    # host writes S_q_eff (valid query rows) and S_kv_eff (valid KV cols =
+    # seq_pos + 1) so the partial_softmax tail mask zeroes the -1e8 padding
+    # rows before softmax instead of letting them overflow exp2.  In prefill
+    # both equal the compile-time seq_len.
+    seq_q_eff_param = ScratchpadParameter("S_q_eff", np.int32)
+    seq_kv_eff_param = ScratchpadParameter("S_kv_eff", np.int32)
+
     # Local L1 Buffers for cos/sin on each matmul worker tile.
     # Identity values (cos=1, sin=0) make rope_kernel a no-op.
     cos_bufs = [
@@ -803,6 +819,8 @@ def fused_mha(
                     memcopy_kernel_scale,
                     i,
                     mha_rtps_list[1][i],
+                    seq_q_eff_param,
+                    seq_kv_eff_param,
                     worker_barrier_list[1][i],
                     idx_buffer_softmax,
                     scale_buffer_softmax,
@@ -938,6 +956,10 @@ def fused_mha(
         for j in range(3):
             for i in range(number_of_pipelines):
                 worker_barrier_list[j][i].set(1)
+
+        # Sync scratchpad parameters (S_q_eff / S_kv_eff) written by the host
+        # via ParameterScratchpad before the workers read them.
+        sync_parameters()
 
         # Workers start automatically — no rt.start() needed in 1.4.0.
         # Trace is configured on Program, not Runtime, after construction.
