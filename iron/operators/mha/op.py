@@ -30,6 +30,7 @@ class MHA(MLIROperator):
     num_of_pipelines: int = field(default=1, repr=False)
     context: object = field(default=None, repr=False)
     seq_len_kv: int = 0  # S_kv for decode: defaults to seq_len if 0
+    use_runtime_seq_len: bool = field(default=False, repr=False)  # scratchpad S_q/S_kv_eff
 
     _name_aliases: ClassVar[Dict[str, str]] = {
         **MLIROperator._name_aliases,
@@ -63,6 +64,7 @@ class MHA(MLIROperator):
                     "emulate_bf16_mmul_with_bfp16": True,
                     "trace_size": 0,
                     "verbose": False,
+                    "use_runtime_seq_len": self.use_runtime_seq_len,
                 },
             ),
         )

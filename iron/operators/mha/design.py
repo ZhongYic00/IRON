@@ -205,6 +205,7 @@ def fused_mha(
     trace_size: int = 0,
     verbose: bool = False,
     func_prefix: str = "",
+    use_runtime_seq_len: bool = False,
 ):
 
     of_depth = 2
@@ -572,11 +573,14 @@ def fused_mha(
         loop_idx_q = mha_rtps[0]
         loop_idx_kv = mha_rtps[1]
 
-        # S_q_eff / S_kv_eff are runtime sequence lengths written by the host
-        # each dispatch (scratchpad parameters); for decode S_kv_eff = seq_pos+1
-        # so the tail of the KV cache is masked off before softmax.
-        S_q_effective = seq_q_eff_param.read()
-        S_kv_effective = seq_kv_eff_param.read()
+        # S_q_eff / S_kv_eff: runtime scratchpad values when use_runtime_seq_len
+        # (decoded full-ELF path), else the compile-time baked values.
+        if use_runtime_seq_len:
+            S_q_effective = seq_q_eff_param.read()
+            S_kv_effective = seq_kv_eff_param.read()
+        else:
+            S_q_effective = mha_rtps[2]
+            S_kv_effective = mha_rtps[3]
 
         for _ in range_(sys.maxsize):
 
@@ -743,14 +747,19 @@ def fused_mha(
         for j in range(3)
     ]
 
-    # Runtime sequence lengths, written by the host each dispatch via
-    # SequenceFullELFCallable.params (ParameterScratchpad).  For decode the
-    # host writes S_q_eff (valid query rows) and S_kv_eff (valid KV cols =
-    # seq_pos + 1) so the partial_softmax tail mask zeroes the -1e8 padding
-    # rows before softmax instead of letting them overflow exp2.  In prefill
-    # both equal the compile-time seq_len.
-    seq_q_eff_param = ScratchpadParameter("S_q_eff", np.int32)
-    seq_kv_eff_param = ScratchpadParameter("S_kv_eff", np.int32)
+    # Runtime sequence lengths: only used when the MHA runs in a full-ELF
+    # OperatorSequence (use_runtime_seq_len=True), where the host writes
+    # S_q_eff / S_kv_eff each dispatch via SequenceFullELFCallable.params
+    # (ParameterScratchpad).  For decode S_kv_eff = seq_pos masks the -1e8 KV
+    # padding tail before softmax so it doesn't overflow exp2 into NaN.
+    # In the plain xclbin path (prefill) the scratchpad values would be absent,
+    # so the softmax worker falls back to the compile-time mha_rtps values.
+    seq_q_eff_param = (
+        ScratchpadParameter("S_q_eff", np.int32) if use_runtime_seq_len else None
+    )
+    seq_kv_eff_param = (
+        ScratchpadParameter("S_kv_eff", np.int32) if use_runtime_seq_len else None
+    )
 
     # Local L1 Buffers for cos/sin on each matmul worker tile.
     # Identity values (cos=1, sin=0) make rope_kernel a no-op.
@@ -819,8 +828,8 @@ def fused_mha(
                     memcopy_kernel_scale,
                     i,
                     mha_rtps_list[1][i],
-                    seq_q_eff_param,
-                    seq_kv_eff_param,
+                    seq_q_eff_param if seq_q_eff_param is not None else mha_rtps_list[1][i],
+                    seq_kv_eff_param if seq_kv_eff_param is not None else mha_rtps_list[1][i],
                     worker_barrier_list[1][i],
                     idx_buffer_softmax,
                     scale_buffer_softmax,
@@ -959,7 +968,8 @@ def fused_mha(
 
         # Sync scratchpad parameters (S_q_eff / S_kv_eff) written by the host
         # via ParameterScratchpad before the workers read them.
-        sync_parameters()
+        if use_runtime_seq_len:
+            sync_parameters()
 
         # Workers start automatically — no rt.start() needed in 1.4.0.
         # Trace is configured on Program, not Runtime, after construction.
