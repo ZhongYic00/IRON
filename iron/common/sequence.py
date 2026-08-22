@@ -571,16 +571,22 @@ class SequenceFullELFCallable(SequenceCallable):
     def params(self):
         """Lazy ParameterScratchpad bound to this ELF's ctrl scratchpad BO.
 
-        The ``params.txt`` describing the runtime parameters is written by
-        ``aie-lower-parameters`` into the ``<mlir>.prj`` project directory next
-        to the fused MLIR source. Returns ``None`` if the sequence declared no
+        The ``params.txt`` describing the runtime parameters is emitted by
+        ``aiecc --get-scratchpad-parameters`` into the build directory next to
+        the fused MLIR source. Returns ``None`` if the sequence declared no
         runtime parameters (in which case the file is not written).
         """
         if self._params is not None:
             return self._params
-        mlir_filename = self.op.artifacts[0].mlir_input.filename
-        params_path = Path(mlir_filename + ".prj") / "params.txt"
-        if not params_path.exists():
+        mlir_file = Path(self.op.artifacts[0].mlir_input.filename)
+        # aiecc (>= 1.4.0) emits `params.txt` into the build directory next to
+        # the fused `.mlir` (its `scratchpad-parameters` edge outputs a file
+        # literally named `params.txt` in the process cwd).  Older setups may
+        # have placed it under `<mlir>.prj/`, so fall back to that location.
+        candidate_paths = [mlir_file.with_name("params.txt")]
+        candidate_paths.append(mlir_file.parent / (mlir_file.name + ".prj") / "params.txt")
+        params_path = next((p for p in candidate_paths if p.exists()), None)
+        if params_path is None:
             return None
         from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import (
             ParameterScratchpad,

@@ -514,11 +514,17 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
         commands = []
 
         for artifact in worklist:
+            # mlir-aie >= 1.4.0 uses the declarative `--get-<name>` output
+            # selectors; the old `--generate-full-elf` / `--no-compile-host`
+            # flags are no longer recognised. Host compilation is skipped
+            # unless `--get-host` is requested, so no `--no-compile-host`
+            # equivalent is needed. `--get-scratchpad-parameters` emits the
+            # `params.txt` sidecar that the host runtime needs to write
+            # runtime scratchpad parameters (e.g. `softmax_vector_size`).
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
                 f"-j{os.environ.get('AIECC_JOBS', '1')}",
-                "--no-compile-host",
             ]
             if self.use_chess:
                 compile_cmd += [
@@ -534,9 +540,10 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 ]
             compile_cmd += [
                 "--expand-load-pdis",
-                "--generate-full-elf",
+                "--get-full-elf",
                 "--full-elf-name",
                 os.path.abspath(artifact.filename),
+                "--get-scratchpad-parameters",
                 *artifact.extra_flags,
                 os.path.abspath(artifact.mlir_input.filename),
             ]
@@ -569,11 +576,12 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
         commands = []
         # Now we know for each mlir source if we need to generate an xclbin, an insts.bin or both for it
         for mlir_source in mlir_sources:
+            # mlir-aie >= 1.4.0: `--no-compile-host` is dropped; host
+            # compilation is skipped unless `--get-host` is requested.
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
                 f"-j{os.environ.get('AIECC_JOBS', '1')}",
-                "--no-compile-host",
             ]
             if self.use_chess:
                 compile_cmd += [
@@ -597,7 +605,7 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                     0
                 ]  # TODO: this does not handle the case of multiple xclbins with different kernel names or flags from the same MLIR
                 compile_cmd += first_xclbin.extra_flags + [
-                    "--aie-generate-xclbin",
+                    "--get-xclbin",
                     "--xclbin-name=" + os.path.abspath(first_xclbin.filename),
                     "--xclbin-kernel-name=" + first_xclbin.kernel_name,
                 ]
@@ -610,10 +618,10 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 first_insts_bin = mlir_sources_to_insts[mlir_source][
                     0
                 ]  # TODO: this does not handle the case of multiple insts.bins with different flags from the same MLIR
-                if not do_compile_xclbin:
-                    compile_cmd += ["--no-compile"]
+                # Requesting only `--get-npu-insts` (without `--get-xclbin`)
+                # is exactly what `--no-compile` used to mean in the old CLI.
                 compile_cmd += first_insts_bin.extra_flags + [
-                    "--aie-generate-npu-insts",
+                    "--get-npu-insts",
                     "--npu-insts-name=" + os.path.abspath(first_insts_bin.filename),
                 ]
             compile_cmd += [os.path.abspath(mlir_source.filename)]

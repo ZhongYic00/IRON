@@ -170,7 +170,7 @@ def _patch_for_1_4_0():
     def _finish_task_group(self, tg):
         self._compat_recorded.append(("finish_task_group", tg))
 
-    def _sync_parameters(self):
+    def _record_sync_parameters(self):
         self._compat_recorded.append(("sync_parameters",))
 
     def _inline_ops(self, fn, *args):
@@ -281,7 +281,7 @@ def _patch_for_1_4_0():
     _Runtime.drain = _drain
     _Runtime.task_group = _task_group
     _Runtime.finish_task_group = _finish_task_group
-    _Runtime.sync_parameters = _sync_parameters
+    _Runtime.sync_parameters = _record_sync_parameters
     _Runtime.inline_ops = _inline_ops
     _Runtime.set_barrier = _set_barrier
     _Runtime.enable_trace = _enable_trace
