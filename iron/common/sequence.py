@@ -427,7 +427,9 @@ class OperatorSequence(AIEOperatorBase):
         scratch_args = [
             arg
             for arg in args
-            if arg not in self.input_args and arg not in self.output_args
+            if arg not in self.input_args
+            and arg not in self.output_args
+            and arg not in independent
         ]
         # Also include explicit buffers that are only used for slicing
         for explicit_buf in self.explicit_buffer_sizes:
@@ -435,14 +437,15 @@ class OperatorSequence(AIEOperatorBase):
                 explicit_buf not in self.input_args
                 and explicit_buf not in self.output_args
                 and explicit_buf not in scratch_args
+                and explicit_buf not in independent
             ):
                 scratch_args.append(explicit_buf)
         scratch_buffer_size = add_buffers("scratch", scratch_args)
 
-        # Independent input args become their own buffer type (= arg name) and
-        # thus their own top-level set_arg; subbuffer_layout[name] records the
-        # "k"-/"v"-typed entry with offset 0.
-        independent_order = [a for a in self.input_args if a in independent]
+        # Independent buffer args (their own buffer type = arg name) get their
+        # own top-level set_arg; they need not be in input_args -- e.g. K/V
+        # cache written by StridedCopy and read by MHA.
+        independent_order = list(self.independent_buffer_args)
         independent_sizes = [add_buffers(name, [name]) for name in independent_order]
 
         buffer_sizes = (input_buffer_size, output_buffer_size, scratch_buffer_size)
