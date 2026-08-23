@@ -8,6 +8,7 @@ from .gemv.op import GEMV
 from .mha.op import MHA
 from .rms_norm.op import RMSNorm
 from .rope.op import RoPE
+from .qk_norm.op import QKNorm
 from .silu.op import SiLU
 from .softmax.op import Softmax
 from .swiglu_decode.op import SwiGLUDecode
