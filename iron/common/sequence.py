@@ -119,6 +119,8 @@ class FusedDispatch(SequenceDispatch):
             subbuffer_layout=seq.subbuffer_layout,
             buffer_sizes=seq.buffer_sizes,
             slice_info=seq.slice_info,
+            independent_order=seq.independent_order,
+            independent_sizes=seq.independent_sizes,
         )
 
     def _collect_kernel_artifacts(self, seq):
@@ -266,6 +268,7 @@ class OperatorSequence(AIEOperatorBase):
         dispatch="auto",
         extra_flags=None,
         share_designs=False,
+        independent_buffer_args=None,
         *args,
         **kwargs,
     ):
@@ -288,6 +291,11 @@ class OperatorSequence(AIEOperatorBase):
         self.explicit_buffer_sizes = (
             buffer_sizes or {}
         )  # Optional dict: buffer_name -> size_in_bytes
+        # Input args promoted to their own top-level set_arg (their own
+        # buffer_type = arg name) instead of being packed into the "input"
+        # buffer.  Enables zero-copy K/V: the host set_arg binds a persistent
+        # KV BO directly instead of copying into the packed input buffer.
+        self.independent_buffer_args = independent_buffer_args or []
         # Extra aiecc flags forwarded to the full-ELF build (e.g. --dynamic-objFifos
         # for placed/routed whole-array designs that would otherwise overflow AIE2p
         # program memory). Empty by default, so other sequences are unaffected.
@@ -411,7 +419,10 @@ class OperatorSequence(AIEOperatorBase):
         for buf_name, (base_name, start, end, args_spec) in sliced_buffers.items():
             slice_info[buf_name] = (base_name, start, end)
 
-        input_buffer_size = add_buffers("input", self.input_args)
+        independent = set(self.independent_buffer_args)
+        packed_input = [a for a in self.input_args if a not in independent]
+
+        input_buffer_size = add_buffers("input", packed_input)
         output_buffer_size = add_buffers("output", self.output_args)
         scratch_args = [
             arg
@@ -428,14 +439,30 @@ class OperatorSequence(AIEOperatorBase):
                 scratch_args.append(explicit_buf)
         scratch_buffer_size = add_buffers("scratch", scratch_args)
 
+        # Independent input args become their own buffer type (= arg name) and
+        # thus their own top-level set_arg; subbuffer_layout[name] records the
+        # "k"-/"v"-typed entry with offset 0.
+        independent_order = [a for a in self.input_args if a in independent]
+        independent_sizes = [add_buffers(name, [name]) for name in independent_order]
+
         buffer_sizes = (input_buffer_size, output_buffer_size, scratch_buffer_size)
-        return subbuffer_layout, buffer_sizes, slice_info
+        return (
+            subbuffer_layout,
+            buffer_sizes,
+            slice_info,
+            independent_order,
+            independent_sizes,
+        )
 
     def set_up_artifacts(self):
         """Resolve the dispatch policy and build its compile artifacts."""
-        self.subbuffer_layout, self.buffer_sizes, self.slice_info = (
-            self.calculate_buffer_layout()
-        )
+        (
+            self.subbuffer_layout,
+            self.buffer_sizes,
+            self.slice_info,
+            self.independent_order,
+            self.independent_sizes,
+        ) = self.calculate_buffer_layout()
         self._dispatch = self._dispatch.resolve(aie_utils.get_current_device())
         self._dispatch.set_up_artifacts(self)
 
@@ -564,6 +591,8 @@ class SequenceFullELFCallable(SequenceCallable):
         self.run_handle.set_arg(0, self.input_buffer.buffer_object())
         self.run_handle.set_arg(1, self.output_buffer.buffer_object())
         self.run_handle.set_arg(2, self.scratch_buffer.buffer_object())
+        for i, name in enumerate(self.op.independent_order):
+            self.run_handle.set_arg(3 + i, self.independent_buffers[name].buffer_object())
 
         self._params = None
 
@@ -602,9 +631,25 @@ class SequenceFullELFCallable(SequenceCallable):
         self.scratch_buffer = XRTTensor(
             (_n_elements(scratch_sz),), dtype=ml_dtypes.bfloat16
         )
+        # Independent input args get their own top-level BO.  They are bound to
+        # dedicated set_arg slots; the host may re-bind a persistent BO before
+        # each dispatch (zero-copy K/V).
+        self.independent_buffers = {}
+        for name, size in zip(
+            self.op.independent_order, self.op.independent_sizes
+        ):
+            self.independent_buffers[name] = XRTTensor(
+                (_n_elements(size),), dtype=ml_dtypes.bfloat16
+            )
 
     def get_buffer(self, buffer_name):
         if buffer_name in self._buffer_cache:
+            return self._buffer_cache[buffer_name]
+        if buffer_name in self.independent_buffers:
+            # Independent input arg: return its own top-level BO directly (not a
+            # sub-view of the packed input buffer), so the host can write/persist
+            # it independently.
+            self._buffer_cache[buffer_name] = self.independent_buffers[buffer_name]
             return self._buffer_cache[buffer_name]
         buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
         parent = {

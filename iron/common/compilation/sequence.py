@@ -378,6 +378,8 @@ class SequenceMLIRArtifact(MLIRArtifact):
         subbuffer_layout: dict[str, tuple[str, int, int]],
         buffer_sizes: tuple[int, int, int],
         slice_info: dict[str, tuple[str, int, int]] | None = None,
+        independent_order: list[str] | None = None,
+        independent_sizes: list[int] | None = None,
     ) -> None:
         dependencies = list(operator_mlir_map.values())
         super().__init__(filename, dependencies)
@@ -386,6 +388,8 @@ class SequenceMLIRArtifact(MLIRArtifact):
         self.subbuffer_layout = subbuffer_layout
         self.buffer_sizes = buffer_sizes
         self.slice_info = slice_info or {}
+        self.independent_order = independent_order or []
+        self.independent_sizes = independent_sizes or []
 
 
 # Helper Functions
@@ -548,17 +552,26 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
             itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
 
             # RuntimeSequenceOp
-            @aiex.runtime_sequence(
+            seq_type_args = [
                 np.ndarray[(input_buffer_size // itemsize,), buf_dtype],
                 np.ndarray[(output_buffer_size // itemsize,), buf_dtype],
                 np.ndarray[(scratch_buffer_size // itemsize,), buf_dtype],
-            )
-            def sequence(input_buf, output_buf, scratch_buf):
+            ]
+            for name, size in zip(
+                artifact.independent_order, artifact.independent_sizes
+            ):
+                seq_type_args.append(np.ndarray[(size // itemsize,), buf_dtype])
+
+            @aiex.runtime_sequence(*seq_type_args)
+            def sequence(*bufs):
+                input_buf, output_buf, scratch_buf = bufs[0], bufs[1], bufs[2]
                 consolidated_buffers = {
                     "input": input_buf,
                     "output": output_buf,
                     "scratch": scratch_buf,
                 }
+                for name, buf in zip(artifact.independent_order, bufs[3:]):
+                    consolidated_buffers[name] = buf
 
                 # Execute operations in runlist order
                 configure_op = None
