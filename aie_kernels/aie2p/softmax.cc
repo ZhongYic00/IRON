@@ -27,7 +27,8 @@ void softmax_simple_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict out
     auto it_scale = aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
     auto it_soft_out = aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
 
-    aie::vector<bfloat16, SM_VEC_LEN> in_elems, exp_val, input_bf16, log2e_vec, max_val_vec;
+    aie::vector<bfloat16, SM_VEC_LEN> in_elems, exp_val, input_bf16, log2e_vec;
+    aie::vector<float, SM_VEC_LEN> max_val_vec;
     aie::accum<accfloat, SM_VEC_LEN> out_vals, exp_val_accum, scaled_accum, exp_in_accum;
 
     float max_val = 0;
@@ -44,12 +45,15 @@ void softmax_simple_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict out
     for (int i = 0; i < elem_iters; i++) {
         input_bf16 = *it_log_in++;
         scaled_accum = aie::mul(input_bf16, log2e_vec);
-        running_max = aie::reduce_max(scaled_accum.to_vector<bfloat16>());
+        // Max must be reduced in f32: bf16 rounding of a large score (Qwen3's
+        // k_norm gamma reaches ~96, so q@k can be ~1e4) leaves a positive
+        // scaled-max residual that overflows exp2 into NaN/inf.
+        running_max = aie::reduce_max(scaled_accum.to_vector<float>());
         if (running_max > max_val) {
             max_val = running_max;
         }
     }
-    max_val_vec = aie::broadcast<bfloat16, SM_VEC_LEN>(max_val);
+    max_val_vec = aie::broadcast<float, SM_VEC_LEN>(max_val);
 
     // Second pass
     for (int i = 0; i < elem_iters; i++) {
@@ -103,7 +107,8 @@ void partial_softmax_alias_bf16(bfloat16 *restrict input_vector,
     auto it_exp_in = aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
     auto it_exp_out = aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
 
-    aie::vector<bfloat16, SM_VEC_LEN> in_elems, exp_val, input_bf16, log2e_vec, max_val_vec;
+    aie::vector<bfloat16, SM_VEC_LEN> in_elems, exp_val, input_bf16, log2e_vec;
+    aie::vector<float, SM_VEC_LEN> max_val_vec;
     aie::accum<accfloat, SM_VEC_LEN> out_vals, exp_val_accum, scaled_accum, exp_in_accum;
 
     float max_val = 0;
@@ -120,7 +125,8 @@ void partial_softmax_alias_bf16(bfloat16 *restrict input_vector,
     for (int i = 0; i < elem_iters; i++) {
         input_bf16 = *it_log_in++;
         scaled_accum = aie::mul(input_bf16, log2e_vec);
-        running_max = aie::reduce_max(scaled_accum.to_vector<bfloat16>());
+        // Max must be reduced in f32 (see softmax_simple_bf16).
+        running_max = aie::reduce_max(scaled_accum.to_vector<float>());
         if (running_max > max_val) {
             max_val = running_max;
         }
@@ -134,7 +140,7 @@ void partial_softmax_alias_bf16(bfloat16 *restrict input_vector,
         max_val = scale_buffer[row_idx];
     }
 
-    max_val_vec = aie::broadcast<bfloat16, SM_VEC_LEN>(max_val);
+    max_val_vec = aie::broadcast<float, SM_VEC_LEN>(max_val);
 
     // Second pass
     for (int i = 0; i < elem_iters; i++) {
