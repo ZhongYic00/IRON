@@ -37,10 +37,6 @@ from iron.operators import (
     RMSNorm, GEMV, StridedCopy, Repeat, Softmax,
     ElementwiseMul, ElementwiseAdd, SiLU, Transpose, RoPE, QKNorm,
 )
-from iron.operators.gemv_argmax.op import GEMVArgmax
-from iron.operators.gemv_argmax_bf16.op import GEMVArgmaxBF16
-from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
-import pyxrt as xrt
 
 # ---------------- model config ----------------
 emb_dim = 1024
@@ -145,12 +141,19 @@ class Qwen3NPU:
                                   tile_size_input=1, tile_size_output=emb_dim // 8, context=c)
         self.repeat = Repeat(rows=n_kv_heads, cols=max_seq_len * head_dim,
                              repeat=n_heads // n_kv_heads, transfer_size=head_dim, context=c)
-        # lm_head: bf16 GEMV + f32 argmax epilogue, INDEPENDENT dispatch. bf16
-        # weights halve the DDR read (622MB f32 -> 311MB bf16) vs GEMVArgmax;
-        # f32 accumulation keeps argmax precision. Verified against model.py.
-        self.lmhead_op = GEMVArgmaxBF16(M=vocab_size, K=emb_dim, num_aie_columns=8,
-                                        tile_size_input=4, tile_size_output=vocab_size // 8,
-                                        context=c)
+        # lm_head: bf16 GEMV computing logits (f32 accumulate, bf16 store), fused
+        # INTO the sequence exactly like llama — the final RMSNorm feeds a plain
+        # GEMV(W_out_head) that emits "logits" as the sequence output. argmax runs
+        # on the host over the bf16 logits (llama does the same; bf16 logits have
+        # ~0.4% rel error, far below any margin that would flip the argmax).
+        # tile_size_output must divide M/num_aie_columns = 151936/8 = 18992.
+        # 18992 = 16 * 1187 (1187 prime), so the only viable m_input=4-compatible
+        # tile outputs are 4, 8, 16. llama's 32 works only because its vocab
+        # 128256/8=16032 is 32-divisible; Qwen3 vocab is not. 16 is the largest
+        # valid tile and keeps L1 pressure low.
+        self.lmhead = GEMV(M=vocab_size, K=emb_dim, num_aie_columns=8,
+                           tile_size_input=4, tile_size_output=16,
+                           context=c)
 
     # ---------------- sequence ----------------
     def _build_sequence(self):
@@ -186,24 +189,28 @@ class Qwen3NPU:
                 (self.gemv_ffn_down, f"W_down_{i}", "ffn_hidden", "ffn_output"),
                 (self.residual_add, "x", "ffn_output", "x"),
             ])
-        # Final RMSNorm stays in the sequence (bf16 weighted, matches llama). It emits
-        # an independent output buffer "x_final" so "x" is not an in-out arg (which
-        # would collide in subbuffer_layout). lm_head (f32 argmax) runs as an
-        # independent dispatch on x_final.
-        runlist += [(self.rms, "x", "W_final_norm", "x_final")]
+        # Final RMSNorm + lm_head GEMV both live in the SAME sequence (llama-style),
+        # so decode is a single dispatch producing "logits". The final RMSNorm emits
+        # an independent buffer "x_final" (avoids in-out x colliding in
+        # subbuffer_layout), which the lm_head GEMV reads.
+        runlist += [
+            (self.rms, "x", "W_final_norm", "x_final"),
+            (self.lmhead, "W_out_head", "x_final", "logits"),
+        ]
 
         cache_size = n_kv_heads * max_seq_len * head_dim * 2
         self.seq = OperatorSequence(
             "qwen3_0.6b_decode",
             runlist,
             input_args=["x", "rope_angles"],
-            output_args=["x_final"],
+            output_args=["logits"],
             buffer_sizes={
                 **{f"k_cache_{i}": cache_size for i in range(n_layers)},
                 **{f"v_cache_{i}": cache_size for i in range(n_layers)},
                 "scores_values": n_heads * max_seq_len * head_dim * 2,
                 "scores_values_T": n_heads * max_seq_len * head_dim * 2,
                 "rope_angles": head_dim * 2,
+                "logits": vocab_size * 2,
             },
             context=self.context,
         )
@@ -226,6 +233,7 @@ class Qwen3NPU:
             self._set(f"W_up_{i}", w["up"])
             self._set(f"W_down_{i}", w["down"])
         self._set("W_final_norm", self.final_norm)
+        self._set("W_out_head", self.out_head)
         attn_scale_buf = self.fc.get_buffer("attn_scale").torch_view()
         attn_scale_buf[:] = torch.full(attn_scale_buf.shape, scale, dtype=torch.bfloat16)
 
@@ -235,14 +243,6 @@ class Qwen3NPU:
         # sync static buffers to device
         self.fc.input_buffer.to("npu")
         self.fc.scratch_buffer.to("npu")
-
-        # ---- independent lm_head (bf16 GEMV + f32 argmax) ----
-        self.lmhead_op.compile()
-        self.lmhead_call = self.lmhead_op.get_callable()
-        self.lmhead_mat = XRTTensor.from_torch(self.out_head.flatten().contiguous())  # bf16 (151936*1024,)
-        self.lmhead_vec = XRTTensor.from_torch(torch.zeros(emb_dim, dtype=torch.bfloat16))
-        self.lmhead_out = XRTTensor.from_torch(torch.zeros(16, dtype=torch.float32))
-        self.lmhead_mat.buffer_object().sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
     def _set(self, name, t):
         b = self.fc.get_buffer(name).torch_view()
@@ -275,19 +275,11 @@ class Qwen3NPU:
         self.fc.params.write("softmax_vector_size", np.int32(seq_pos + 1))
         self.fc.params.sync()
 
-        self.fc()  # runs 28 layers + final RMSNorm, leaves x_final in output buffer
+        self.fc()  # runs 28 layers + final RMSNorm + lm_head GEMV -> logits
 
-        # x_final is already synced to CPU by SequenceCallable.__call__ (_sync_outputs)
-        x_final = self.fc.get_buffer("x_final").torch_view()
-        self.lmhead_vec.to_torch().copy_(x_final)  # bf16 -> bf16, no cast
-        self.lmhead_vec.buffer_object().sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-        self.lmhead_call(self.lmhead_mat, self.lmhead_vec, self.lmhead_out)
-        self.lmhead_out.buffer_object().sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-        out = self.lmhead_out.to_torch()
-        vals = out[0::2]
-        idxs = out[1::2].to(torch.int32)
-        best = torch.argmax(vals).item()
-        return idxs[best].item()
+        # logits already synced to CPU by SequenceCallable.__call__ (_sync_outputs)
+        logits = self.fc.get_buffer("logits").torch_view()
+        return torch.argmax(logits).item()
 
 
 if __name__ == "__main__":
