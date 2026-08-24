@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """HF cosine check: prefill the SAME prompt through HF (f32) and the pure-iron
-NPU (bf16), then compare the final-norm hidden state (the vector feeding
-lm_head) cosine. Avoids greedy-decoding divergence (Qwen3 thinking mode).
+NPU (bf16), then compare the final logits (the lm_head output) cosine and
+argmax. This directly proves the 28-layer accumulation is correct and that the
+NPU would pick the same next token as HF greedy decode.
 
-cosine > 0.99 on the final hidden proves the 28-layer accumulation is correct.
+cosine > 0.99 on the logits proves the full forward is correct.
 """
 import sys, time
 import torch
@@ -40,27 +41,26 @@ def main():
     L = len(prompt_ids)
     print(f"prompt: {L} tokens", flush=True)
 
-    # ---- NPU prefill (token by token) ----
+    # ---- NPU prefill (token by token); the last __call__ leaves logits in the
+    #      auto-synced output buffer ----
     for pos, tid in enumerate(prompt_ids):
-        x = emb[tid]
-        npu(x, seq_pos=pos)
-    x_final_npu = npu.fc.get_buffer("x_final").torch_view().to(torch.float32)  # (1024,)
+        npu(emb[tid], seq_pos=pos)
+    logits_npu = npu.fc.get_buffer("logits").torch_view().to(torch.float32)  # (vocab,)
 
     # ---- HF prefill (single forward) ----
     with torch.no_grad():
-        out = hf(input_ids, output_hidden_states=True)
-    last_hidden = out.hidden_states[-1]                      # (1, L, 1024)
-    hf_final_norm = hf.model.norm(last_hidden)               # (1, L, 1024) after final RMSNorm
-    finalvec_hf = hf_final_norm[0, -1, :].to(torch.float32)  # last position
+        out = hf(input_ids)
+    logits_hf = out.logits[0, -1, :].to(torch.float32)  # (vocab,)
 
-    # ---- cosine ----
-    cos = torch.nn.functional.cosine_similarity(x_final_npu, finalvec_hf, dim=0)
-    maxerr = (x_final_npu - finalvec_hf).abs().max()
-    nan = torch.isnan(x_final_npu).any().item()
-    print(f"\nNPU x_final[0:5] = {x_final_npu[:5].tolist()}")
-    print(f"HF  final[0:5]   = {finalvec_hf[:5].tolist()}")
+    # ---- cosine + argmax ----
+    cos = torch.nn.functional.cosine_similarity(logits_npu, logits_hf, dim=0)
+    am_npu = torch.argmax(logits_npu).item()
+    am_hf = torch.argmax(logits_hf).item()
+    nan = torch.isnan(logits_npu).any().item()
+    print(f"\nNPU logits[:5] = {logits_npu[:5].tolist()}")
+    print(f"HF  logits[:5] = {logits_hf[:5].tolist()}")
     print(f"cosine = {cos.item():.6f}")
-    print(f"maxerr = {maxerr.item():.6f}")
+    print(f"argmax  : npu={am_npu} hf={am_hf} {'MATCH' if am_npu == am_hf else 'DIFF'}")
     print(f"nan = {nan}")
     print("PASS" if cos.item() > 0.99 and not nan else "CHECK")
 

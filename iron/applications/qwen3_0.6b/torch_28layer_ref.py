@@ -106,17 +106,29 @@ def main():
         ffn_out = (w_d.float() @ ffn.float().T).T.to(torch.bfloat16)
         x = (x.float() + ffn_out.float()).to(torch.bfloat16)
 
-        # compare last position hidden vs HF layer i hidden (final-norm NOT applied here; HF hidden_states[i] is post-residual pre-norm)
-        hf_h = out.hidden_states[i + 1][0, -1, :].to(torch.float32)  # after layer i
-        my_h = x[-1].to(torch.float32)
-        cos = torch.nn.functional.cosine_similarity(my_h, hf_h, dim=0)
-        cos_per_layer.append(cos.item())
-        print(f"layer {i}: cosine = {cos:.6f}")
+        # compare last position hidden vs HF layer i hidden. NOTE: HF's
+        # hidden_states[i+1] is the raw post-residual output of layer i for
+        # i=0..26, BUT hidden_states[28] (i=27) is the FINAL-NORM output, not
+        # layer 27's raw output (transformers applies model.norm before storing
+        # the last hidden state). So only compare per-layer up to i < n_layers-1;
+        # the final-norm comparison is done separately below.
+        if i < n_layers - 1:
+            hf_h = out.hidden_states[i + 1][0, -1, :].to(torch.float32)  # after layer i (raw)
+            my_h = x[-1].to(torch.float32)
+            cos = torch.nn.functional.cosine_similarity(my_h, hf_h, dim=0)
+            cos_per_layer.append(cos.item())
+            print(f"layer {i}: cosine = {cos:.6f}")
 
-    # final norm cosine
+    # final norm cosine: my x_final (final RMSNorm applied once) vs HF's
+    # last_hidden_state (already final-norm applied by transformers). Do NOT
+    # re-apply model.norm to hidden_states[-1] — that would double-norm it.
     w_fin = sf.get_tensor("model.norm.weight").to(torch.bfloat16)
     x_final = rms_norm(x, w_fin)[-1].to(torch.float32)
-    hf_final = hf.model.norm(out.hidden_states[-1])[0, -1, :].to(torch.float32)
+    hf_final = getattr(out, "last_hidden_state", None)
+    if hf_final is None:
+        # AutoModelForCausalLM returns logits only; fall back to model output
+        hf_final = out.hidden_states[-1]  # already final-norm'ed
+    hf_final = hf_final[0, -1, :].to(torch.float32)
     cos_fin = torch.nn.functional.cosine_similarity(x_final, hf_final, dim=0)
     print(f"final norm: cosine = {cos_fin:.6f}")
     print("MIN layer cosine:", min(cos_per_layer))
