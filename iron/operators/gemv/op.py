@@ -55,13 +55,13 @@ class GEMV(MLIROperator):
             self.K >= self.kernel_vector_size and self.K % self.kernel_vector_size == 0
         ):
             raise ValueError("K must be multiple of kernel_vector_size")
-        if self.epilogue not in ("none", "gelu"):
+        if self.epilogue not in ("none", "gelu", "silu"):
             raise ValueError(
-                f"unknown epilogue {self.epilogue!r} (expected 'none' or 'gelu')"
+                f"unknown epilogue {self.epilogue!r} (expected 'none', 'gelu', or 'silu')"
             )
-        if self.epilogue == "gelu" and self.tile_size_output % 16 != 0:
+        if self.epilogue in ("gelu", "silu") and self.tile_size_output % 16 != 0:
             raise ValueError(
-                f"gelu epilogue needs tile_size_output % 16 == 0 (got {self.tile_size_output})"
+                f"{self.epilogue} epilogue needs tile_size_output % 16 == 0 (got {self.tile_size_output})"
             )
 
         MLIROperator.__init__(self, context=self.context)
@@ -81,8 +81,8 @@ class GEMV(MLIROperator):
     def _kernel_link_file(self):
         # With the gelu epilogue the core also links the gelu kernel, so the object becomes an
         # archive of (matvec, gelu); the plain matvec stays a single object.
-        if self.epilogue == "gelu":
-            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_gelu_kernels.a"
+        if self.epilogue in ("gelu", "silu"):
+            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.epilogue}_kernels.a"
         return f"gemv_{self.K}k_{self.kernel_vector_size}vs.o"
 
     def get_mlir_artifact(self):
@@ -123,24 +123,24 @@ class GEMV(MLIROperator):
                 f"-DVEC_SIZE={self.kernel_vector_size}",
             ],
         )
-        if self.epilogue == "gelu":
-            # The gelu kernel lives in aie2p/gelu.cc, so the fused epilogue is NPU2-only.
+        if self.epilogue in ("gelu", "silu"):
+            # The gelu/silu kernels live in aie2p/, so the fused epilogue is NPU2-only.
             if get_kernel_dir() != "aie2p":
                 raise NotImplementedError(
-                    "gemv gelu epilogue is only available on NPU2 (aie2p); "
+                    f"gemv {self.epilogue} epilogue is only available on NPU2 (aie2p); "
                     f"current kernel dir is {get_kernel_dir()!r}"
                 )
-            gelu_obj = KernelObjectArtifact(
-                "gelu.o",
+            epi_obj = KernelObjectArtifact(
+                f"{self.epilogue}.o",
                 dependencies=[
                     SourceArtifact(
-                        self.context.base_dir / "aie_kernels" / "aie2p" / "gelu.cc"
+                        self.context.base_dir / "aie_kernels" / "aie2p" / f"{self.epilogue}.cc"
                     )
                 ],
             )
             return [
                 KernelArchiveArtifact(
-                    self._kernel_link_file, dependencies=[matvec_obj, gelu_obj]
+                    self._kernel_link_file, dependencies=[matvec_obj, epi_obj]
                 )
             ]
         return [matvec_obj]

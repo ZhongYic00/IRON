@@ -50,4 +50,11 @@ void silu_bf16(bfloat16 *restrict input, bfloat16 *restrict output, int input_si
     silu_tanh_approx_bf16(input, output, input_size);
 }
 
+void silu_tile_bf16(uint32_t n, bfloat16 *restrict c)
+{
+    // In-place SiLU over an m_output-sized C tile, mirroring gelu_tile_bf16's
+    // signature and extern-C linkage so it can be used as a GEMV epilogue.
+    silu_tanh_approx_bf16(c, c, (int32_t)n);
+}
+
 } // extern "C"

@@ -124,15 +124,37 @@ class FusedDispatch(SequenceDispatch):
         )
 
     def _collect_kernel_artifacts(self, seq):
-        """Kernel artifacts from all child operators, prefixed per operator index."""
+        """Kernel artifacts from all child operators, prefixed per operator index.
+
+        Prefixes are applied RECURSIVELY through KernelArchiveArtifact so that
+        the object files bundled inside a static archive also get the per-op
+        symbol prefix.  Without this, a fused-epilogue GEMV (which ships matvec +
+        gelu/silu as an archive) links with undefined ``op{idx}_*`` symbols when
+        placed into an OperatorSequence.
+        """
         kernel_artifacts = []
         for idx, op in enumerate(seq.unique_designs()[0]):
             objs = op.get_kernel_artifacts()
             for obj in objs:
-                obj.filename = f"op{idx}_{obj.filename}"
-                obj.prefix_symbols = f"op{idx}_"
+                self._prefix_kernel_artifact_tree(obj, f"op{idx}_")
             kernel_artifacts.extend(objs)
         return kernel_artifacts
+
+    def _prefix_kernel_artifact_tree(self, artifact, prefix):
+        """Rename a kernel artifact and recursively prefix its kernel-object
+        dependencies (e.g. the .o files inside a KernelArchiveArtifact).
+
+        Only build artifacts (KernelObjectArtifact/KernelArchiveArtifact) are
+        renamed; SourceArtifact dependencies (.cc sources) keep their on-disk
+        filenames, or compilation can no longer find them.
+        """
+        if isinstance(artifact, comp.KernelObjectArtifact):
+            artifact.filename = f"{prefix}{artifact.filename}"
+            artifact.prefix_symbols = prefix
+        elif isinstance(artifact, comp.KernelArchiveArtifact):
+            artifact.filename = f"{prefix}{artifact.filename}"
+        for dep in getattr(artifact, "dependencies", []):
+            self._prefix_kernel_artifact_tree(dep, prefix)
 
     def make_callable(self, seq):
         return SequenceFullELFCallable(seq)
