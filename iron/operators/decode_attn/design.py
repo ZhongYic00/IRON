@@ -103,7 +103,21 @@ def decode_attn(
 
     # ObjectFifos per column.
     inQ = [ObjectFifo(L1_Q_ty, name=f"inQ_{c}", depth=2) for c in range(cols)]
+    # KV rides a shim->MemTile->core forward chain: the shim producer fills the
+    # WHOLE interleaved head (2*S_KV, D) once, the MemTile forward() streams it
+    # into per-block (2*B_KV, D) tiles via dims_to_stream, matching mha's
+    # inK.cons().forward() pattern. This keeps the shim BD count O(cols) instead
+    # of O(NB*cols), which is what deadlocked at S_KV=256.
     inKV = [ObjectFifo(L1_KV_ty, name=f"inKV_{c}", depth=1) for c in range(cols)]
+    memKV = [
+        inKV[c].cons().forward(
+            name=f"memKV_{c}",
+            tile=Tile(col=c, row=1),
+            dims_to_stream=[(2 * B_KV, D), (D, 1)],
+            depth=1,
+        )
+        for c in range(cols)
+    ]
     outO = [ObjectFifo(L1_O_ty, name=f"outO_{c}", depth=2) for c in range(cols)]
 
     # persistent buffers per column
@@ -177,7 +191,7 @@ def decode_attn(
         Worker(
             core_body,
             [
-                inQ[c].cons(), inKV[c].cons(), outO[c].prod(),
+                inQ[c].cons(), memKV[c].cons(), outO[c].prod(),
                 scores_buf[c], p_buf[c], out_acc_buf[c], sum_buf[c],
                 scores_kernel, softmax_kernel, context_kernel, finalize_kernel,
                 zero_kernel,
@@ -209,16 +223,17 @@ def decode_attn(
         )
         for c in range(cols)
     ]
-    # one KV block tile = whole [K_block | V_block] = 2*B_KV*D elements at
-    # block b of head c: offset c*(2*S_KV*D) + b*(2*B_KV*D).
+    # ONE tap per KV head covering the whole interleaved [K|V] head
+    # (2*S_KV*D elements at offset c*(2*S_KV*D)). The MemTile forward() then
+    # streams it into per-block (2*B_KV, D) tiles. This keeps the shim BD count
+    # O(cols) instead of O(NB*cols).
     KV_tap = [
         TensorAccessPattern(
             tensor_dims=L3_KV_ty.__args__[0],
-            offset=c * (2 * S_KV * D) + b * (2 * B_KV * D),
-            sizes=[1, 1, 1, 2 * B_KV * D],
-            strides=[0, 0, 0, 1],
+            offset=c * (2 * S_KV * D),
+            sizes=[1, 1, 2 * S_KV, D],
+            strides=[0, 0, D, 1],
         )
-        for b in range(NB)
         for c in range(cols)
     ]
 
@@ -246,11 +261,11 @@ def decode_attn(
         tg = TaskGroup()
         for c in range(cols):
             h_inQ[c].fill(Q, tap=Q_tap[c], group=tg)
-        # scores pass then context pass: 2*NB KV blocks per column
+        # scores pass then context pass: re-fill each head's WHOLE KV once per
+        # pass (the MemTile forward() streams it into NB blocks on the core).
         for _pass in range(2):
-            for b in range(NB):
-                for c in range(cols):
-                    h_inKV[c].fill(KV, tap=KV_tap[b * cols + c], group=tg)
+            for c in range(cols):
+                h_inKV[c].fill(KV, tap=KV_tap[c], group=tg)
         for c in range(cols):
             h_outO[c].drain(O, tap=O_tap[c], wait=True, group=tg)
         tg.finish()
