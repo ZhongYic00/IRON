@@ -99,8 +99,8 @@ class Qwen3NPU:
         c = self.context
         self.rms = RMSNorm(size=emb_dim, num_aie_columns=1, num_channels=1,
                            tile_size=emb_dim, weighted=True, epsilon=eps, context=c)
-        self.gemv_qkv = GEMV(M=qkv_dim, K=emb_dim, num_aie_columns=8,
-                             tile_size_input=4, tile_size_output=qkv_dim // 8, context=c)
+        self.gemv_qkv = GEMV(M=qkv_dim, K=emb_dim, num_aie_columns=4,
+                             tile_size_input=4, tile_size_output=qkv_dim // 4, context=c)
         self.qk_norm = QKNorm(head_dim=head_dim, n_q_heads=n_heads, n_k_heads=n_kv_heads,
                               epsilon=eps, context=c)
         self.rope_q = RoPE(rows=n_heads, cols=head_dim, angle_rows=1, context=c)
@@ -131,16 +131,16 @@ class Qwen3NPU:
             num_heads=n_heads, num_kv_heads=n_kv_heads, head_dim=head_dim,
             seq_len_kv=max_seq_len, num_aie_columns=8, block_kv=block_kv,
             use_runtime_seq_len=True, context=c)
-        self.gemv_output = GEMV(M=emb_dim, K=q_dim, num_aie_columns=8,
-                                tile_size_input=4, tile_size_output=emb_dim // 8, context=c)
+        self.gemv_output = GEMV(M=emb_dim, K=q_dim, num_aie_columns=4,
+                                tile_size_input=4, tile_size_output=emb_dim // 4, context=c)
         self.residual_add = ElementwiseAdd(size=emb_dim, tile_size=emb_dim // 8, context=c)
-        self.gemv_ffn = GEMV(M=hidden_dim, K=emb_dim, num_aie_columns=8,
-                             tile_size_input=4, tile_size_output=hidden_dim // 8, context=c)
+        self.gemv_ffn = GEMV(M=hidden_dim, K=emb_dim, num_aie_columns=4,
+                             tile_size_input=4, tile_size_output=hidden_dim // 4, context=c)
         self.silu = SiLU(size=hidden_dim, tile_size=hidden_dim // 8, num_aie_columns=8, context=c)
         self.mul = ElementwiseMul(size=hidden_dim, tile_size=hidden_dim // 8,
                                   num_aie_columns=8, context=c)
-        self.gemv_ffn_down = GEMV(M=emb_dim, K=hidden_dim, num_aie_columns=8,
-                                  tile_size_input=1, tile_size_output=emb_dim // 8, context=c)
+        self.gemv_ffn_down = GEMV(M=emb_dim, K=hidden_dim, num_aie_columns=4,
+                                  tile_size_input=1, tile_size_output=emb_dim // 4, context=c)
         # lm_head: bf16 GEMV computing logits (f32 accumulate, bf16 store), fused
         # INTO the sequence exactly like llama — the final RMSNorm feeds a plain
         # GEMV(W_out_head) that emits "logits" as the sequence output. argmax runs
