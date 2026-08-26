@@ -34,8 +34,8 @@ aie_utils.set_current_device(NPU2())
 from iron.common.context import AIEContext
 from iron.common.sequence import OperatorSequence
 from iron.operators import (
-    RMSNorm, GEMV, StridedCopy, Repeat, Softmax,
-    ElementwiseMul, ElementwiseAdd, SiLU, Transpose, RoPE, QKNorm,
+    RMSNorm, GEMV, StridedCopy, DecodeAttention,
+    ElementwiseMul, ElementwiseAdd, SiLU, RoPE, QKNorm,
 )
 
 # ---------------- model config ----------------
@@ -50,6 +50,7 @@ qkv_dim = q_dim + 2 * kv_dim      # 4096
 vocab_size = 151936
 n_layers = 28
 max_seq_len = 512
+block_kv = 64                     # decode_attn KV block size along S
 eps = 1e-6
 rope_theta = 1e6
 
@@ -104,31 +105,32 @@ class Qwen3NPU:
                               epsilon=eps, context=c)
         self.rope_q = RoPE(rows=n_heads, cols=head_dim, angle_rows=1, context=c)
         self.rope_k = RoPE(rows=n_kv_heads, cols=head_dim, angle_rows=1, context=c)
+        # K/V cache now lives in a single INTERLEAVED buffer per layer:
+        #   [K_b0 | V_b0 | K_b1 | V_b1 | ...]  (block_kv tokens per block),
+        # matching decode_attn's KV input layout. Each head occupies a full
+        # 2*max_seq_len*head_dim element block; K goes to the front half of each
+        # block, V to the back half. The per-token write position is a runtime
+        # offset parameter computed on the host (see __call__).
         self.sc_k = StridedCopy(input_sizes=(n_kv_heads, head_dim), input_strides=(head_dim, 1),
                                 input_offset=0, output_sizes=(n_kv_heads, head_dim),
-                                output_strides=(max_seq_len * head_dim, 1), output_offset=0,
+                                output_strides=(2 * max_seq_len * head_dim, 1), output_offset=0,
                                 input_buffer_size=kv_dim,
-                                output_buffer_size=n_kv_heads * max_seq_len * head_dim,
-                                num_aie_channels=1, output_offset_parameter="cache_offset", context=c)
+                                output_buffer_size=n_kv_heads * 2 * max_seq_len * head_dim,
+                                num_aie_channels=1, output_offset_parameter="k_cache_offset", context=c)
         self.sc_v = StridedCopy(input_sizes=(n_kv_heads, head_dim), input_strides=(head_dim, 1),
                                 input_offset=0, output_sizes=(n_kv_heads, head_dim),
-                                output_strides=(max_seq_len * head_dim, 1), output_offset=0,
+                                output_strides=(2 * max_seq_len * head_dim, 1), output_offset=0,
                                 input_buffer_size=kv_dim,
-                                output_buffer_size=n_kv_heads * max_seq_len * head_dim,
-                                num_aie_channels=1, output_offset_parameter="cache_offset", context=c)
-        self.gemv_scores = GEMV(M=max_seq_len, K=head_dim, num_aie_columns=8,
-                                tile_size_input=4, tile_size_output=max_seq_len // 8,
-                                num_batches=n_heads, context=c)
-        self.attn_scale = ElementwiseMul(size=n_heads * max_seq_len,
-                                         tile_size=max_seq_len // 8, num_aie_columns=8, context=c)
-        self.softmax = Softmax(rows=n_heads, cols=max_seq_len, num_aie_columns=1,
-                               num_channels=1, rtp_vector_size=max_seq_len,
-                               vector_size_parameter="softmax_vector_size", context=c)
-        self.transpose_v = Transpose(M=max_seq_len, N=head_dim, num_aie_columns=2,
-                                     num_channels=1, m=256, n=32, s=8, context=c)
-        self.gemv_context = GEMV(M=head_dim, K=max_seq_len, num_aie_columns=8,
-                                 tile_size_input=4, tile_size_output=4,
-                                 num_batches=n_heads, context=c)
+                                output_buffer_size=n_kv_heads * 2 * max_seq_len * head_dim,
+                                num_aie_channels=1, output_offset_parameter="v_cache_offset", context=c)
+        # Fused decode attention (single query, M=1): scores-GEMV + softmax +
+        # context-GEMV in one kernel per (head, column). Replaces the prefill-style
+        # gemv_scores + attn_scale + softmax + transpose_v + gemv_context chain,
+        # and subsumes the GQA Repeat (one KV head per column).
+        self.decode_attn = DecodeAttention(
+            num_heads=n_heads, num_kv_heads=n_kv_heads, head_dim=head_dim,
+            seq_len_kv=max_seq_len, num_aie_columns=8, block_kv=block_kv,
+            use_runtime_seq_len=True, context=c)
         self.gemv_output = GEMV(M=emb_dim, K=q_dim, num_aie_columns=8,
                                 tile_size_input=4, tile_size_output=emb_dim // 8, context=c)
         self.residual_add = ElementwiseAdd(size=emb_dim, tile_size=emb_dim // 8, context=c)
@@ -139,8 +141,6 @@ class Qwen3NPU:
                                   num_aie_columns=8, context=c)
         self.gemv_ffn_down = GEMV(M=emb_dim, K=hidden_dim, num_aie_columns=8,
                                   tile_size_input=1, tile_size_output=emb_dim // 8, context=c)
-        self.repeat = Repeat(rows=n_kv_heads, cols=max_seq_len * head_dim,
-                             repeat=n_heads // n_kv_heads, transfer_size=head_dim, context=c)
         # lm_head: bf16 GEMV computing logits (f32 accumulate, bf16 store), fused
         # INTO the sequence exactly like llama — the final RMSNorm feeds a plain
         # GEMV(W_out_head) that emits "logits" as the sequence output. argmax runs
@@ -165,20 +165,9 @@ class Qwen3NPU:
                 (self.qk_norm, f"qkv_out[0:{k_end}]", "qk_normed", f"W_qk_gamma_{i}"),
                 (self.rope_q, f"qk_normed[0:{q_end}]", "rope_angles", "rope_q"),
                 (self.rope_k, f"qk_normed[{q_end}:{k_end}]", "rope_angles", "rope_k"),
-                (self.sc_k, "rope_k", f"k_cache_{i}"),
-                (self.sc_v, f"qkv_out[{v_start}:{v_end}]", f"v_cache_{i}"),
-                (self.repeat, f"k_cache_{i}", "scores_keys"),
-                (self.repeat, f"v_cache_{i}", "scores_values"),
-                (self.gemv_scores, "scores_keys", "rope_q", "scores"),
-                (self.attn_scale, "scores", "attn_scale", "scores"),
-                (self.softmax, "scores", "weights"),
-            ] + [
-                (self.transpose_v,
-                 f"scores_values[{h * vps}:{(h + 1) * vps}]",
-                 f"scores_values_T[{h * vps}:{(h + 1) * vps}]")
-                for h in range(n_heads)
-            ] + [
-                (self.gemv_context, "scores_values_T", "weights", "context"),
+                (self.sc_k, "rope_k", f"kv_cache_{i}"),
+                (self.sc_v, f"qkv_out[{v_start}:{v_end}]", f"kv_cache_{i}"),
+                (self.decode_attn, "rope_q", f"kv_cache_{i}", "context"),
                 (self.gemv_output, f"W_o_{i}", "context", "attn_output"),
                 (self.residual_add, "x", "attn_output", "x"),
                 (self.rms, "x", f"W_norm2_{i}", "x_norm"),
@@ -198,17 +187,16 @@ class Qwen3NPU:
             (self.lmhead, "W_out_head", "x_final", "logits"),
         ]
 
-        cache_size = n_kv_heads * max_seq_len * head_dim * 2
+        # interleaved KV cache: K and V share one buffer per layer
+        # ([K_b0|V_b0|K_b1|V_b1|...]), sized 2x the old separated k/v cache.
+        kv_cache_size = n_kv_heads * 2 * max_seq_len * head_dim * 2
         self.seq = OperatorSequence(
             "qwen3_0.6b_decode",
             runlist,
             input_args=["x", "rope_angles"],
             output_args=["logits"],
             buffer_sizes={
-                **{f"k_cache_{i}": cache_size for i in range(n_layers)},
-                **{f"v_cache_{i}": cache_size for i in range(n_layers)},
-                "scores_values": n_heads * max_seq_len * head_dim * 2,
-                "scores_values_T": n_heads * max_seq_len * head_dim * 2,
+                **{f"kv_cache_{i}": kv_cache_size for i in range(n_layers)},
                 "rope_angles": head_dim * 2,
                 "logits": vocab_size * 2,
             },
@@ -221,7 +209,6 @@ class Qwen3NPU:
 
     # ---------------- weight load ----------------
     def _load_weights(self):
-        scale = 1.0 / math.sqrt(head_dim)
         for i in range(n_layers):
             w = self.weight_cache[i]
             self._set(f"W_norm1_{i}", w["input_norm"])
@@ -234,8 +221,6 @@ class Qwen3NPU:
             self._set(f"W_down_{i}", w["down"])
         self._set("W_final_norm", self.final_norm)
         self._set("W_out_head", self.out_head)
-        attn_scale_buf = self.fc.get_buffer("attn_scale").torch_view()
-        attn_scale_buf[:] = torch.full(attn_scale_buf.shape, scale, dtype=torch.bfloat16)
 
         # RoPE angle table (interleaved cos/sin, half dim)
         self._precompute_rope_angles()
@@ -264,15 +249,22 @@ class Qwen3NPU:
     # ---------------- forward (single token) ----------------
     def __call__(self, x, seq_pos):
         """x: (emb_dim,) bf16 hidden state for the new token; seq_pos: position index."""
-        cache_offset = seq_pos * head_dim
+        # interleaved KV cache write positions for this token (element offsets,
+        # one head occupies a 2*max_seq_len*head_dim block with [K_b|V_b] layout).
+        b = seq_pos // block_kv
+        j = seq_pos % block_kv
+        blk = 2 * block_kv * head_dim
+        k_off = b * blk + j * head_dim                 # K[b][j]
+        v_off = b * blk + (block_kv + j) * head_dim    # V[b][j]
 
         # update per-token rope_angles
         self.fc.get_buffer("rope_angles").torch_view()[:] = self.angle_table[seq_pos]
         # write x
         self.fc.get_buffer("x").torch_view()[:] = x
 
-        self.fc.params.write("cache_offset", np.int32(cache_offset))
-        self.fc.params.write("softmax_vector_size", np.int32(seq_pos + 1))
+        self.fc.params.write("k_cache_offset", np.int32(k_off))
+        self.fc.params.write("v_cache_offset", np.int32(v_off))
+        self.fc.params.write("S_kv_eff", np.int32(seq_pos + 1))
         self.fc.params.sync()
 
         self.fc()  # runs 28 layers + final RMSNorm + lm_head GEMV -> logits

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from .decode_attn.op import DecodeAttention
 from .elementwise_add.op import ElementwiseAdd
 from .elementwise_mul.op import ElementwiseMul
 from .gemm.op import GEMM
