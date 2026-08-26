@@ -22,6 +22,7 @@ After 28 layers: final RMSNorm -> GEMV(lm_head, f32) -> logits.
 
 import torch
 import math
+import os
 import numpy as np
 import ml_dtypes
 from pathlib import Path
@@ -284,7 +285,8 @@ class Qwen3NPU:
 
 if __name__ == "__main__":
     # Smoke test: load weights, run one decode step, report argmax + no NaN.
-    model = Qwen3NPU("/home/zyc/Packages/NPU/Qwen3-0.6B/model.safetensors")
+    # Weights dir (model.safetensors + tokenizer) via $QWEN3_MODEL_DIR.
+    model = Qwen3NPU(os.environ.get("QWEN3_MODEL_DIR", "/srv/qwen3-0.6b") + "/model.safetensors")
     x = torch.randn(emb_dim, dtype=torch.bfloat16)
     token_id = model(x, seq_pos=10)
     print(f"argmax token_id = {token_id}")

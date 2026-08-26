@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Extras for the Qwen3-0.6B application (install in addition to the
+# repository-level requirements.txt, which pins the mlir-aie/llvm-aie
+# toolchain):
+transformers
+safetensors
+ml_dtypes

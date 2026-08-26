@@ -13,17 +13,18 @@ via StridedCopy cache_offset), which is correct for a 0.6B model / short prompt.
 Verifies: (1) generated text is coherent (Chinese included), (2) token-for-token
 agreement with HF greedy decode.
 """
+import os
 import sys, time
 import torch
 import numpy as np
 
-sys.path.insert(0, "/home/zyc/Github/iron/iron/applications/qwen3_0.6b")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qwen3_npu import Qwen3NPU, emb_dim
 
 from safetensors import safe_open
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_PATH = "/home/zyc/Packages/NPU/Qwen3-0.6B/"
+MODEL_PATH = os.environ.get("QWEN3_MODEL_DIR", "/srv/qwen3-0.6b") + "/"
 
 def main():
     prompt = sys.argv[1] if len(sys.argv) > 1 else "你好，请介绍一下你自己"

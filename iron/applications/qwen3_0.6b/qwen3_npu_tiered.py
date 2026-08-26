@@ -21,6 +21,7 @@ head_dim=128, vocab=151936, n_layer=28, rope_theta=1e6, eps=1e-6.
 
 import torch
 import math
+import os
 import numpy as np
 import ml_dtypes
 from pathlib import Path
@@ -323,7 +324,7 @@ class Qwen3NPUTiered:
 
 
 if __name__ == "__main__":
-    model = Qwen3NPUTiered("/home/zyc/Packages/NPU/Qwen3-0.6B/model.safetensors")
+    model = Qwen3NPUTiered(os.environ.get("QWEN3_MODEL_DIR", "/srv/qwen3-0.6b") + "/model.safetensors")
     x = torch.randn(emb_dim, dtype=torch.bfloat16)
     print(f"argmax@10 = {model(x, seq_pos=10)}")
     print(f"argmax@300 = {model(x, seq_pos=300)}")

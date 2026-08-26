@@ -8,13 +8,19 @@
 # picks the highest, so listing the CPU index first is not enough to avoid the
 # CUDA build served from PyPI. We therefore also pin torch to the "+cpu" local
 # version below, which is only available from the PyTorch CPU index.
+#
+# Toolchain note: this branch's compilation flow (iron/common/compilation) uses
+# the mlir-aie 1.4.0 aiecc selectors (--get-full-elf / --get-scratchpad-parameters),
+# so mlir-aie must be >= 1.4.0. The no-rtti wheel variant is the one validated
+# on Ryzen AI (Strix Point) NPU2. Both pins below are permanent GitHub release
+# assets (the llvm-aie "nightly" release tag retains every daily wheel).
 --index-url https://download.pytorch.org/whl/cpu
---find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4
+--find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.4.0
 --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
 --extra-index-url https://pypi.org/simple
 
-mlir_aie==1.3.5.dev20+g167f34d
-llvm-aie==21.0.0.2026062301+cb664e8c
+mlir_aie_no_rtti==1.4.0
+llvm-aie==21.0.0.2026080601+f4a72c27
 
 black
 reuse

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Stream a chat with Qwen3-0.6B on NPU using the fused-decode-attn model.
 
@@ -12,17 +13,18 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 import torch
 
-sys.path.insert(0, "/home/zyc/Github/iron/iron/applications/qwen3_0.6b")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qwen3_npu import Qwen3NPU, emb_dim
 
 from safetensors import safe_open
 from transformers import AutoTokenizer
 
-MODEL_PATH = "/home/zyc/Packages/NPU/Qwen3-0.6B/"
+DEFAULT_MODEL_DIR = os.environ.get("QWEN3_MODEL_DIR", "/srv/qwen3-0.6b")
 
 
 def main():
@@ -30,13 +32,15 @@ def main():
     ap.add_argument("--prompt", type=str, default="你好，请介绍一下MoE")
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--system", type=str, default=None)
+    ap.add_argument("--model-path", type=str, default=DEFAULT_MODEL_DIR,
+                    help="dir with model.safetensors + tokenizer files")
     args = ap.parse_args()
 
     print("loading model...", flush=True)
     t0 = time.perf_counter()
-    model = Qwen3NPU(MODEL_PATH + "model.safetensors")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    emb = safe_open(MODEL_PATH + "model.safetensors", framework="pt").get_tensor(
+    model = Qwen3NPU(args.model_path + "/model.safetensors")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    emb = safe_open(args.model_path + "/model.safetensors", framework="pt").get_tensor(
         "model.embed_tokens.weight").to(torch.bfloat16)
     print(f"model loaded in {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
 
