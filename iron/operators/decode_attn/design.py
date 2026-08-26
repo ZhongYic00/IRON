@@ -69,33 +69,31 @@ def decode_attn(
     L1_KV_ty = np.ndarray[(2 * B_KV, D), np.dtype[dtype]]  # [K_block | V_block]
     L1_O_ty = np.ndarray[(heads_per_col, D), np.dtype[dtype]]
 
-    # persistent L1 buffers (heads_per_col heads per column).
-    # scores is f32: raw q@k can be ~1e4, bf16 storage would destroy softmax.
-    scores_ty = np.ndarray[(heads_per_col, S_KV), np.dtype[f32]]
-    p_ty = np.ndarray[(heads_per_col, S_KV), np.dtype[dtype]]
+    # persistent L1 buffers (heads_per_col heads per column), block-local so they
+    # do NOT grow with S_KV (this is what breaks the 64KB tile wall at S_KV>2048).
+    # scores is f32 per-block scratch: raw q@k can be ~1e4, bf16 would destroy it.
+    scores_ty = np.ndarray[(heads_per_col, B_KV), np.dtype[f32]]
     out_acc_ty = np.ndarray[(heads_per_col, D), np.dtype[f32]]
-    sum_ty = np.ndarray[(heads_per_col,), np.dtype[f32]]
+    # running online-softmax state per head: m = row max (log2e-scaled), l = sum.
+    m_ty = np.ndarray[(heads_per_col,), np.dtype[f32]]
+    l_ty = np.ndarray[(heads_per_col,), np.dtype[f32]]
 
     # kernels
     scores_kernel = Kernel(
         f"{func_prefix}attn_scores_block", f"{func_prefix}{kernel_object}",
         [L1_Q_ty, i32, L1_KV_ty, scores_ty, i32, i32, f32],
     )
-    softmax_kernel = Kernel(
-        f"{func_prefix}attn_softmax_head", f"{func_prefix}{kernel_object}",
-        [scores_ty, i32, p_ty, sum_ty, i32],
-    )
-    context_kernel = Kernel(
-        f"{func_prefix}attn_context_block", f"{func_prefix}{kernel_object}",
-        [p_ty, i32, L1_KV_ty, out_acc_ty, i32],
+    online_kernel = Kernel(
+        f"{func_prefix}attn_online_block", f"{func_prefix}{kernel_object}",
+        [scores_ty, i32, L1_KV_ty, out_acc_ty, m_ty, l_ty, i32, i32],
     )
     finalize_kernel = Kernel(
         f"{func_prefix}attn_finalize", f"{func_prefix}{kernel_object}",
-        [out_acc_ty, i32, sum_ty, L1_O_ty],
+        [out_acc_ty, i32, l_ty, L1_O_ty],
     )
     zero_kernel = Kernel(
-        f"{func_prefix}attn_zero_outacc", f"{func_prefix}{kernel_object}",
-        [out_acc_ty, i32],
+        f"{func_prefix}attn_zero_state", f"{func_prefix}{kernel_object}",
+        [out_acc_ty, m_ty, l_ty, i32],
     )
 
     # scale = log2e / sqrt(D)
@@ -120,15 +118,10 @@ def decode_attn(
     ]
     outO = [ObjectFifo(L1_O_ty, name=f"outO_{c}", depth=2) for c in range(cols)]
 
-    # persistent buffers per column
+    # persistent buffers per column (all block/head-local, independent of S_KV).
     scores_buf = [
         Buffer(type=scores_ty, name=f"scores_{c}",
-               initial_value=np.zeros((heads_per_col, S_KV), dtype=f32))
-        for c in range(cols)
-    ]
-    p_buf = [
-        Buffer(type=p_ty, name=f"p_{c}",
-               initial_value=np.zeros((heads_per_col, S_KV), dtype=dtype))
+               initial_value=np.zeros((heads_per_col, B_KV), dtype=f32))
         for c in range(cols)
     ]
     out_acc_buf = [
@@ -136,14 +129,19 @@ def decode_attn(
                initial_value=np.zeros((heads_per_col, D), dtype=f32))
         for c in range(cols)
     ]
-    sum_buf = [
-        Buffer(type=sum_ty, name=f"sum_{c}",
+    m_buf = [
+        Buffer(type=m_ty, name=f"m_{c}",
+               initial_value=np.zeros((heads_per_col,), dtype=f32))
+        for c in range(cols)
+    ]
+    l_buf = [
+        Buffer(type=l_ty, name=f"l_{c}",
                initial_value=np.zeros((heads_per_col,), dtype=f32))
         for c in range(cols)
     ]
 
-    def core_body(q_fifo, kv_fifo, o_fifo, scores, p, out_acc, sum_,
-                  scores_k, sm_k, ctx_k, fin_k, zero_k, seq_kv_eff_param=None,
+    def core_body(q_fifo, kv_fifo, o_fifo, scores, out_acc, m, l,
+                  scores_k, online_k, fin_k, zero_k, seq_kv_eff_param=None,
                   barrier=None):
         # Barrier + scratchpad read live OUTSIDE the while loop (once per
         # dispatch), matching mha's batched_matmul_qk and softmax: the barrier
@@ -157,24 +155,19 @@ def decode_attn(
 
         q = q_fifo.acquire(1)
         o = o_fifo.acquire(1)
-        # pass 1: scores for BOTH heads over the K half of each KV block
+        # reset online state for both heads, then a SINGLE streaming pass: for
+        # each KV block compute block scores and immediately fold them into the
+        # running max/sum + context accumulator (online softmax, FlashAttention-2).
+        for h in range_(heads_per_col):
+            zero_k(out_acc, m, l, h)
         for b in range_(NB):
             kv = kv_fifo.acquire(1)
             for h in range_(heads_per_col):
                 scores_k(q, h, kv, scores, b, seq_pos, scale)
-            kv_fifo.release(1)
-        # softmax + reset accumulator for both heads (L1, no DRAM)
-        for h in range_(heads_per_col):
-            sm_k(scores, h, p, sum_, seq_pos)
-            zero_k(out_acc, h)
-        # pass 2: context for BOTH heads over the V half of each KV block
-        for b in range_(NB):
-            kv = kv_fifo.acquire(1)
-            for h in range_(heads_per_col):
-                ctx_k(p, h, kv, out_acc, b)
+                online_k(scores, h, kv, out_acc, m, l, b, seq_pos)
             kv_fifo.release(1)
         for h in range_(heads_per_col):
-            fin_k(out_acc, h, sum_, o)
+            fin_k(out_acc, h, l, o)
         q_fifo.release(1)
         o_fifo.release(1)
 
@@ -192,9 +185,8 @@ def decode_attn(
             core_body,
             [
                 inQ[c].cons(), memKV[c].cons(), outO[c].prod(),
-                scores_buf[c], p_buf[c], out_acc_buf[c], sum_buf[c],
-                scores_kernel, softmax_kernel, context_kernel, finalize_kernel,
-                zero_kernel,
+                scores_buf[c], out_acc_buf[c], m_buf[c], l_buf[c],
+                scores_kernel, online_kernel, finalize_kernel, zero_kernel,
             ]
             + ([seq_kv_eff_param] if seq_kv_eff_param is not None else [])
             + ([worker_barriers[c]] if use_runtime_seq_len else []),
@@ -227,12 +219,29 @@ def decode_attn(
     # (2*S_KV*D elements at offset c*(2*S_KV*D)). The MemTile forward() then
     # streams it into per-block (2*B_KV, D) tiles. This keeps the shim BD count
     # O(cols) instead of O(NB*cols).
+    #
+    # The shim's DMA BD encodes the leading non-unit dimension (here 2*S_KV) as a
+    # 10-bit wrap field (max 1023), so S_KV > 511 overflows it and the BD writes
+    # out of bounds (clobbering the input buffer -> all-NaN). Mirror mha's
+    # legalize_tas: when 2*S_KV exceeds 1023, collapse the tap to a contiguous
+    # 1-D descriptor ([1,1,1,2*S_KV*D], stride 1). The total element count and the
+    # interleaved [K|V] layout are unchanged, and the shim buffer_length field is
+    # 32-bit so the collapsed length fits, so the MemTile forward(dims_to_stream)
+    # still re-tiles it into per-block (2*B_KV, D) chunks correctly.
+    _kv_outer = 2 * S_KV
+    _kv_sizes = [1, 1, _kv_outer, D]
+    _kv_strides = [0, 0, D, 1]
+    if _kv_outer > 1023:
+        # Collapse to 1-D: the interleaved [K|V] head is contiguous (stride D ==
+        # inner size D), so a flattened stride-1 descriptor is valid.
+        _kv_sizes = [1, 1, 1, _kv_outer * D]
+        _kv_strides = [0, 0, 0, 1]
     KV_tap = [
         TensorAccessPattern(
             tensor_dims=L3_KV_ty.__args__[0],
             offset=c * (2 * S_KV * D),
-            sizes=[1, 1, 2 * S_KV, D],
-            strides=[0, 0, D, 1],
+            sizes=list(_kv_sizes),
+            strides=list(_kv_strides),
         )
         for c in range(cols)
     ]
@@ -261,11 +270,12 @@ def decode_attn(
         tg = TaskGroup()
         for c in range(cols):
             h_inQ[c].fill(Q, tap=Q_tap[c], group=tg)
-        # scores pass then context pass: re-fill each head's WHOLE KV once per
-        # pass (the MemTile forward() streams it into NB blocks on the core).
-        for _pass in range(2):
-            for c in range(cols):
-                h_inKV[c].fill(KV, tap=KV_tap[c], group=tg)
+        # Single streaming pass: fill each head's WHOLE KV once (the MemTile
+        # forward() streams it into NB blocks on the core, and the online
+        # softmax folds each block into the running max/sum + context accumulator
+        # as it arrives, so no second pass is needed).
+        for c in range(cols):
+            h_inKV[c].fill(KV, tap=KV_tap[c], group=tg)
         for c in range(cols):
             h_outO[c].drain(O, tap=O_tap[c], wait=True, group=tg)
         tg.finish()
