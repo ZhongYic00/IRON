@@ -51,6 +51,11 @@ void attn_scores_block(const bfloat16 *__restrict q,
 }
 
 // softmax over pre-scaled scores: p[j] = exp2(s[j] - max); sum = denominator.
+// Handles arbitrary seq_pos (not necessarily a multiple of VEC).  Scores at
+// [seq_pos, S_KV) are already masked to -inf by attn_scores_block, so we can
+// safely round the exp loop up to the next VEC multiple: the -inf lanes
+// contribute exp2(-inf) == 0 and keep the whole thing vectorized (the
+// bare-metal environment has no scalar exp2f/libm to link against).
 void attn_softmax_head(const float *__restrict scores,
                        int32_t h,
                        bfloat16 *__restrict p,
@@ -67,10 +72,15 @@ void attn_softmax_head(const float *__restrict scores,
             max_val = srow[j];
     }
 
+    // number of lanes actually holding a real (unmasked) score, rounded up to
+    // a full VEC chunk so the exp pass stays vectorized.
+    int32_t n_lanes = (seq_pos + VEC - 1) / VEC * VEC;
+    if (n_lanes == 0)
+        n_lanes = VEC;
+
     vector<float, VEC> maxv = broadcast<float, VEC>(max_val);
     accum<accfloat, VEC> exp_accum = zeros<accfloat, VEC>();
-    int32_t j = 0;
-    for (; j + VEC <= seq_pos; j += VEC) {
+    for (int32_t j = 0; j < n_lanes; j += VEC) {
         vector<float, VEC> sv = load_v<VEC>(srow + j);
         accum<accfloat, VEC> sc = zeros<accfloat, VEC>();
         sc = add(sc, sv);
@@ -79,8 +89,10 @@ void attn_softmax_head(const float *__restrict scores,
         store_v(prow + j, ex);
         exp_accum = add(exp_accum, ex);
     }
-    for (; j < S_KV; j++)
-        prow[j] = (bfloat16)0.0f;
+    // mask positions [seq_pos, S_KV) to zero (defensive; context pass only
+    // reads [0, seq_pos)).
+    for (int32_t m = seq_pos; m < S_KV; m++)
+        prow[m] = (bfloat16)0.0f;
     sum[h] = reduce_add(exp_accum.to_vector<float>());
 }
 
