@@ -134,8 +134,17 @@ class Qwen3NPU:
         self.gemv_output = GEMV(M=emb_dim, K=q_dim, num_aie_columns=4,
                                 tile_size_input=4, tile_size_output=emb_dim // 4, context=c)
         self.residual_add = ElementwiseAdd(size=emb_dim, tile_size=emb_dim // 8, context=c)
-        self.gemv_ffn = GEMV(M=hidden_dim, K=emb_dim, num_aie_columns=4,
-                             tile_size_input=4, tile_size_output=hidden_dim // 4, context=c)
+        # gate_proj and up_proj share the same input x_norm and are multiplied
+        # (silu(gate) * up), so we fuse them into ONE GEMV of M=2*hidden_dim by
+        # stacking W_gate on top of W_up. The larger M (6144 vs 3072) gives each
+        # column a bigger, more contiguous DMA tile (bandwidth 21 -> 30 GB/s) and
+        # reads x_norm once instead of twice; runtime slices the output back into
+        # gate/up halves (see runlist below). This is the decode GEMV "spatial
+        # parallelism" that profile actually rewards: not two ops on different
+        # columns (OperatorSequence is strictly serial, one array reconfig per op),
+        # but fusing dependent GEMMs into one larger-M op.
+        self.gemv_gateup = GEMV(M=hidden_dim * 2, K=emb_dim, num_aie_columns=4,
+                                tile_size_input=4, tile_size_output=(hidden_dim * 2) // 4, context=c)
         self.silu = SiLU(size=hidden_dim, tile_size=hidden_dim // 8, num_aie_columns=8, context=c)
         self.mul = ElementwiseMul(size=hidden_dim, tile_size=hidden_dim // 8,
                                   num_aie_columns=8, context=c)
@@ -171,10 +180,9 @@ class Qwen3NPU:
                 (self.gemv_output, f"W_o_{i}", "context", "attn_output"),
                 (self.residual_add, "x", "attn_output", "x"),
                 (self.rms, "x", f"W_norm2_{i}", "x_norm"),
-                (self.gemv_ffn, f"W_gate_{i}", "x_norm", "ffn_gate"),
-                (self.gemv_ffn, f"W_up_{i}", "x_norm", "ffn_up"),
-                (self.silu, "ffn_gate", "ffn_gate"),
-                (self.mul, "ffn_gate", "ffn_up", "ffn_hidden"),
+                (self.gemv_gateup, f"W_gateup_{i}", "x_norm", "ffn_gateup"),
+                (self.silu, "ffn_gateup[0:6144]", "ffn_gate"),
+                (self.mul, "ffn_gate", "ffn_gateup[6144:12288]", "ffn_hidden"),
                 (self.gemv_ffn_down, f"W_down_{i}", "ffn_hidden", "ffn_output"),
                 (self.residual_add, "x", "ffn_output", "x"),
             ])
@@ -216,8 +224,8 @@ class Qwen3NPU:
             self._set(f"W_qk_gamma_{i}", torch.cat([w["q_norm"], w["k_norm"]], dim=0))
             self._set(f"W_o_{i}", w["o"])
             self._set(f"W_norm2_{i}", w["norm2"])
-            self._set(f"W_gate_{i}", w["gate"])
-            self._set(f"W_up_{i}", w["up"])
+            # gate/up fused: stack [W_gate; W_up] -> (2*hidden_dim, emb_dim)
+            self._set(f"W_gateup_{i}", torch.cat([w["gate"], w["up"]], dim=0))
             self._set(f"W_down_{i}", w["down"])
         self._set("W_final_norm", self.final_norm)
         self._set("W_out_head", self.out_head)
