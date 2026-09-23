@@ -16,6 +16,7 @@ _OPERATOR_MODULES = {
     "GEMM": "gemm",
     "GEMV": "gemv",
     "GEMVInt8": "gemv_int8",
+    "QKNormRoPE": "qk_norm_rope",
     "MHA": "mha",
     "RMSNorm": "rms_norm",
     "RoPE": "rope",
