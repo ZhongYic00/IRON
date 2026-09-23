@@ -15,13 +15,20 @@ _OPERATOR_MODULES = {
     "ElementwiseMul": "elementwise_mul",
     "GEMM": "gemm",
     "GEMV": "gemv",
+    "DecodeAttention": "decode_attn",
     "GEMVInt8": "gemv_int8",
     "QKNormRoPE": "qk_norm_rope",
+    "QKVHeadDataParallel": "qkv_head_dp",
+    "QKVHeadDataParallelOurs": "qkv_head_dp:op_ours",
     "MHA": "mha",
     "RMSNorm": "rms_norm",
     "RoPE": "rope",
     "SiLU": "silu",
     "Softmax": "softmax",
+    "SwiGLUMLPDataParallel": "swiglu_mlp_dp",
+    # A "module:attribute" value resolves `name` from that submodule instead of
+    # the package's op module (the int8_ours arm of swiglu_mlp_dp).
+    "SwiGLUMLPDataParallelOurs": "swiglu_mlp_dp:op_ours",
     "SwiGLUDecode": "swiglu_decode",
     "SwiGLUPrefill": "swiglu_prefill",
     "Transpose": "transpose",
@@ -42,6 +49,9 @@ def __getattr__(name):
     module = _OPERATOR_MODULES.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module, _, attr = module.partition(":")
+    if attr:
+        return getattr(importlib.import_module(f".{module}.{attr}", __name__), name)
     return getattr(importlib.import_module(f".{module}.op", __name__), name)
 
 
