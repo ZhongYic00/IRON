@@ -694,9 +694,11 @@ class SequenceFullELFCallable(SequenceCallable):
         mlir_file = Path(self.op.artifacts[0].mlir_input.filename)
         # aiecc (>= 1.4.0) emits `params.txt` into the build directory next to
         # the fused `.mlir` (its `scratchpad-parameters` edge outputs a file
-        # literally named `params.txt` in the process cwd).  Older setups may
-        # have placed it under `<mlir>.prj/`, so fall back to that location.
+        # literally named `params.txt` in the process cwd).  It also lands in
+        # aiecc's own work directory, suffixed `.d` (the `<mlir>.prj/` location
+        # is the older layouts' convention), so fall back to both.
         candidate_paths = [mlir_file.with_name("params.txt")]
+        candidate_paths.append(mlir_file.parent / (mlir_file.name + ".d") / "params.txt")
         candidate_paths.append(mlir_file.parent / (mlir_file.name + ".prj") / "params.txt")
         params_path = next((p for p in candidate_paths if p.exists()), None)
         if params_path is None:
@@ -839,19 +841,11 @@ class SequenceFullELFCallable(SequenceCallable):
         # build (back-region weights stay NaN).  Sync via per-region sub-BOs
         # instead (each sub-BO sync transfers only its own region).
         _sb = self.scratch_buffer
-        _n = _sb.data.size
-        _itemsize = _sb.data.itemsize
-        _chunk_elems = 8 * 1024 * 1024  # 16MB per slice
-        for _off in range(0, _n, _chunk_elems):
-            _cnt = min(_chunk_elems, _n - _off)
-            _sub = XRTSubBuffer(
-                parent_bo=_sb.buffer_object(),
-                offset_bytes=_off * _itemsize,
-                size_bytes=min(_chunk_elems, _n - _off) * _itemsize,
-                shape=(min(_chunk_elems, _n - _off),),
-                dtype=ml_dtypes.bfloat16,
-            )  # no parent: sync this region only
-            _sub._sync_to_device()
+        _storage = _sb.storage
+        _nbytes = _sb.nbytes
+        _chunk_bytes = 8 * 1024 * 1024 * np.dtype(ml_dtypes.bfloat16).itemsize  # 16MB per slice
+        for _off in range(0, _nbytes, _chunk_bytes):
+            _storage.sync_to_device(_off, min(_chunk_bytes, _nbytes - _off))
 
     def _sync_outputs(self):
         # _run just rewrote the output arena on the device, so the device holds the

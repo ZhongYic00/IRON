@@ -9,8 +9,8 @@ combined tap unchanged. design_ours_kvlayout.py; 8 args (one kv_cache).
 
 Ported to Qwen3-4B decode shapes (D=2560, tsi=16, weight_depth=1) for the 4B
 int8 chain's `QKV_HEAD_DP` gate; the 0.6B arm (D=1024, tsi=4, depth=2) is the
-same code path.  See docs/notes/2026-09-13-4b-qkv-head-dp-port.md for why the 4B
-shapes have to take tsi=16/depth=1 (the 16 KB program memory, not L1).
+same code path.  The 4B shapes take tsi=16/depth=1 because of the 16 KB
+program-memory wall, not L1.
 """
 
 import os

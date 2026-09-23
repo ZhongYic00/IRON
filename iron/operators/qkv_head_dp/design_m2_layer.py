@@ -466,7 +466,7 @@ def m2_layer(
     # (2+2+3 = 7), D/4 objects do not (4+4+3 = 11 -> the same error as above), and why
     # the shim cannot simply be handed a D-wide fill.
     if with_attn:
-        # ---- M1 CHANNEL FOLDING (see docs/notes/2026-09-15-flm-parity-int8-limit.md §7) ----
+        # ---- M1 CHANNEL FOLDING ----
         # A compute tile has exactly 2 input DMA channels, and the shipped QKV core already uses
         # both (misc + weight); attention adds inQ + inKV.  Merging the two phases therefore
         # requires FOLDING a stream, not just grafting a core body:

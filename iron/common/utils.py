@@ -3,7 +3,9 @@
 
 import numpy as np
 from aie.dialects.aie import get_target_model, WireBundle
-from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor, xrt as _pyxrt
+from aie.utils.hostruntime.tensor_class import NpuTensor
+from aie.utils.hostruntime.tensor_class import NpuTensor
+from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
 
 
 def get_shim_dma_limit(dev) -> int:
@@ -41,111 +43,67 @@ def float_to_name(v: float) -> str:
 
 class XRTSubBuffer(XRTTensor):
     """
-    A view into a sub-region of an XRTTensor's underlying pyxrt.bo buffer.
+    A view into a sub-region of an XRTTensor's underlying storage.
 
     Inherits from XRTTensor so that isinstance checks in the runtime pass.
-    Bypasses XRTTensor.__init__ to avoid allocating a new buffer object.
+    Implemented on the wheel's native view contract: the sub-view SHARES the
+    parent's Storage (bytes + coherence map), so residency is tracked per byte
+    range on one allocation — a host write through this view's torch_view/data
+    marks its own range host-dirty, the parent's ``to("npu")`` syncs exactly the
+    dirty ranges (no whole-parent clobbering), and a device-side rewrite is
+    pulled back range-wise by ``to("cpu")``.
 
-    The parent XRTTensor must remain alive as long as this sub-buffer is in use.
+    The parent XRTTensor must remain alive as long as this sub-buffer is in use
+    (held via ``_parent``).
     """
 
     def __init__(self, parent_bo, offset_bytes, size_bytes, shape, dtype, parent=None):
         """
         Args:
-            parent_bo: The parent pyxrt.bo object.
+            parent_bo: The parent pyxrt.bo object (unused; kept for call-site
+                compatibility — the region is derived from the parent tensor's
+                shared storage, which is what the coherence model requires).
             offset_bytes: Byte offset into the parent buffer.
-            size_bytes: Size of this sub-region in bytes.
-            shape: Tuple giving the logical shape of this sub-buffer.
+            size_bytes: Byte size of this sub-region (must match shape/dtype).
+            shape: Logical shape of this sub-buffer.
             dtype: numpy dtype for interpreting the buffer contents.
-            parent: The parent XRTTensor this sub-buffer views into. When given,
-                moving this sub-buffer between devices propagates the resulting
-                device state to the parent (they share the same memory), so a
-                later whole-parent sync stays consistent with the sub-views.
+            parent: The parent XRTTensor this sub-buffer views into (required:
+                the coherence model tracks residency on the shared allocation,
+                which only the parent tensor carries).
         """
-        # Skip XRTTensor.__init__ (which would allocate a new bo); set base attrs directly.
-        self.device = "npu"
-        self.dtype = np.dtype(dtype)
+        if parent is None:
+            raise ValueError(
+                "XRTSubBuffer requires the parent XRTTensor (residency is "
+                "tracked per range on the shared allocation, which a raw bo "
+                "handle cannot provide)")
+        dtype = np.dtype(dtype)
+        shape = tuple(shape)
+        nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        if nbytes != size_bytes:
+            raise ValueError(
+                f"XRTSubBuffer: size_bytes={size_bytes} does not match "
+                f"shape={shape} x {dtype} ({nbytes} bytes)")
+        # NpuTensor contract fields, mirroring the wheel's XRTTensor._subview:
+        # share the parent's storage and byte range instead of allocating.
+        NpuTensor.__init__(self, shape, dtype=dtype, device=parent.device)
         self._parent = parent
-        # TODO: replace with XRTTensor.__getitem__ slice support when available upstream
-        self._bo = _pyxrt.bo(parent_bo, size_bytes, offset_bytes)
-        self._shape = tuple(shape)
-        ptr = self._bo.map()
-        self._data = np.frombuffer(ptr, dtype=self.dtype).reshape(self._shape)
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self._shape
-
-    @property
-    def data(self) -> np.ndarray:
-        # `.data` is the write handle for this sub-view. Callers get it to write fresh
-        # host data (inputs, resident weights), but numpy gives us no write hook, so we
-        # conservatively mark this sub-view AND its parent host-dirty ("cpu") on any
-        # access. That makes a subsequent parent `.to("npu")` actually fire the
-        # host->device sync -- otherwise the residency guard no-ops (device already
-        # "npu" from allocation) and the freshly written bytes never reach the device,
-        # so the op computes on stale init-zeros. A redundant re-read sync is cheap;
-        # a silently-skipped write sync is a correctness bug.
-        self.device = "cpu"
-        if self._parent is not None:
-            self._parent.device = "cpu"
-        return self._data
-
-    def buffer_object(self):
-        """Return the underlying pyxrt.bo (required by NPUKernel)."""
-        return self._bo
-
-    def torch_view(self):
-        """Zero-copy torch view of this sub-region's host memory.
-
-        Marks BOTH this sub-view and its parent host-dirty: a torch_view write
-        goes straight into the numpy mirror without passing through .data, so
-        without the parent mark the residency-guarded push inside
-        _sync_inputs would no-op and the device would never see the written
-        weights (running on the zero-initialized scratch instead).
-        """
-        self.device = "cpu"
-        if self._parent is not None:
-            self._parent.device = "cpu"
-        return super().torch_view()
-
-    def to(self, target_device: str):
-        """Move this sub-buffer to ``target_device`` by syncing the whole parent.
-
-        The sub-buffer and its parent alias the same underlying memory. Rather
-        than syncing only this sub-region's bo (whose effect on the parent is
-        unclear), the parent's current residency is set to this sub-view's
-        residency and the *entire parent buffer* is synced. This makes the
-        behaviour explicit and consistent with a caller that writes a sub-view
-        and then pushes it to the device.
-
-        FIXME: This assumes a sub-buffer sync means a whole-parent sync, which
-        is ambiguous in XRT: it is unclear whether ``bo.sync()`` on a sub-buffer
-        transfers only its slice or the whole parent. Because we sync the whole
-        parent here, moving one sub-buffer to a device can clobber sibling
-        sub-buffers that view the same parent (e.g. a host->device sync will
-        overwrite the device side of a sibling whose fresh device data has not
-        been synced back to the host yet). Those siblings are not notified and
-        keep a now-stale ``device`` flag. Revisit once XRT's sub-buffer sync
-        semantics are pinned down (or track per-region dirtiness).
-        """
-        if self._parent is not None:
-            # Reflect this sub-view's current residency onto the parent (e.g.
-            # "cpu" after a torch_view() write) so the parent's own sync fires
-            # instead of no-opping, then sync the whole parent buffer.
-            self._parent.device = self.device
-            result = self._parent.to(target_device)
-            self.device = self._parent.device
-            return result
-        return super().to(target_device)
+        self._shape = shape
+        self._storage = parent.storage
+        self._offset_bytes = parent.storage_offset + offset_bytes
+        self._bo = parent.storage.binding_handle(self._offset_bytes, nbytes)
+        self._data = (
+            parent.storage.host_bytes[
+                self._offset_bytes : self._offset_bytes + nbytes
+            ]
+            .view(self.dtype)
+            .reshape(self._shape)
+        )
 
     @classmethod
     def from_parent(cls, parent, shape, offset_elements, length_elements, dtype):
         """Create an XRTSubBuffer into a sub-region of a parent XRTTensor.
 
         Accepts element-count offsets/lengths and converts to bytes internally.
-        XRTTensor has no built-in slice API; use this until mlir-aie gains
-        XRTTensor.__getitem__ slice support.
         """
         itemsize = np.dtype(dtype).itemsize
         return cls(
