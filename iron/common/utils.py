@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import numpy as np
 from aie.dialects.aie import get_target_model, WireBundle
+from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor, xrt as _pyxrt
 
 
 def get_shim_dma_limit(dev) -> int:
@@ -23,7 +25,7 @@ def float_to_name(v: float) -> str:
     """Convert a float to a filesystem-safe string for use in operator names.
 
     Uses repr() for the shortest exact round-trip representation, then sanitizes
-    characters that are problematic in filenames or shell scripts, for instance:
+    characters that are problematic in filenames or shell scripts:
       '.' -> 'p'  (decimal point)
       '-' -> 'n'  (negative sign / negative exponent)
       '+' -> ''   (positive exponent, redundant)
@@ -37,34 +39,120 @@ def float_to_name(v: float) -> str:
     return repr(v).replace(".", "p").replace("-", "n").replace("+", "")
 
 
-# Widest wrap a shim or mem tile DMA buffer descriptor's size field can encode.
-# Not exposed by the Python bindings (AIETargetModel::getDmaBdWrapBits is
-# unbound), so it is written down here rather than in each design; gemv,
-# repeat and mha all hardcoded the same 1023 independently.
-#
-# This is the same 10 bits on every target model this repo builds for --
-# BaseNPU1TargetModel and BaseNPU2TargetModel both inherit it unmodified from
-# AIE2TargetModel::getDmaBdWrapBits, which does not override it per device --
-# so callers do not need to look it up per-device. It is NOT the same for
-# every tile type, though: core tiles get an 8-bit wrap (max 255), not 10-bit.
-# This constant is only valid for shim/mem tile descriptors, which is what
-# every current caller (gemv, repeat, mha, flm.GEMM) uses it for.
-DMA_BD_MAX_WRAP = (1 << 10) - 1
-
-
-def split_run(run: int, max_wrap: int = DMA_BD_MAX_WRAP) -> list[tuple[int, int]]:
-    """Encode a contiguous run of ``run`` elements as BD (size, stride) dims.
-
-    One dimension suffices while the run fits the BD's size field; a longer run
-    splits into two at the cost of one of the four available dimensions.
-
-        >>> split_run(512)
-        [(512, 1)]
-        >>> split_run(2048)
-        [(2, 1024), (1024, 1)]
+class XRTSubBuffer(XRTTensor):
     """
-    if run <= max_wrap:
-        return [(run, 1)]
-    if run % 2:
-        raise ValueError(f"cannot split an odd run ({run}) exceeding {max_wrap}")
-    return [(2, run // 2), (run // 2, 1)]
+    A view into a sub-region of an XRTTensor's underlying pyxrt.bo buffer.
+
+    Inherits from XRTTensor so that isinstance checks in the runtime pass.
+    Bypasses XRTTensor.__init__ to avoid allocating a new buffer object.
+
+    The parent XRTTensor must remain alive as long as this sub-buffer is in use.
+    """
+
+    def __init__(self, parent_bo, offset_bytes, size_bytes, shape, dtype, parent=None):
+        """
+        Args:
+            parent_bo: The parent pyxrt.bo object.
+            offset_bytes: Byte offset into the parent buffer.
+            size_bytes: Size of this sub-region in bytes.
+            shape: Tuple giving the logical shape of this sub-buffer.
+            dtype: numpy dtype for interpreting the buffer contents.
+            parent: The parent XRTTensor this sub-buffer views into. When given,
+                moving this sub-buffer between devices propagates the resulting
+                device state to the parent (they share the same memory), so a
+                later whole-parent sync stays consistent with the sub-views.
+        """
+        # Skip XRTTensor.__init__ (which would allocate a new bo); set base attrs directly.
+        self.device = "npu"
+        self.dtype = np.dtype(dtype)
+        self._parent = parent
+        # TODO: replace with XRTTensor.__getitem__ slice support when available upstream
+        self._bo = _pyxrt.bo(parent_bo, size_bytes, offset_bytes)
+        self._shape = tuple(shape)
+        ptr = self._bo.map()
+        self._data = np.frombuffer(ptr, dtype=self.dtype).reshape(self._shape)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._shape
+
+    @property
+    def data(self) -> np.ndarray:
+        # `.data` is the write handle for this sub-view. Callers get it to write fresh
+        # host data (inputs, resident weights), but numpy gives us no write hook, so we
+        # conservatively mark this sub-view AND its parent host-dirty ("cpu") on any
+        # access. That makes a subsequent parent `.to("npu")` actually fire the
+        # host->device sync -- otherwise the residency guard no-ops (device already
+        # "npu" from allocation) and the freshly written bytes never reach the device,
+        # so the op computes on stale init-zeros. A redundant re-read sync is cheap;
+        # a silently-skipped write sync is a correctness bug.
+        self.device = "cpu"
+        if self._parent is not None:
+            self._parent.device = "cpu"
+        return self._data
+
+    def buffer_object(self):
+        """Return the underlying pyxrt.bo (required by NPUKernel)."""
+        return self._bo
+
+    def torch_view(self):
+        """Zero-copy torch view of this sub-region's host memory.
+
+        Marks BOTH this sub-view and its parent host-dirty: a torch_view write
+        goes straight into the numpy mirror without passing through .data, so
+        without the parent mark the residency-guarded push inside
+        _sync_inputs would no-op and the device would never see the written
+        weights (running on the zero-initialized scratch instead).
+        """
+        self.device = "cpu"
+        if self._parent is not None:
+            self._parent.device = "cpu"
+        return super().torch_view()
+
+    def to(self, target_device: str):
+        """Move this sub-buffer to ``target_device`` by syncing the whole parent.
+
+        The sub-buffer and its parent alias the same underlying memory. Rather
+        than syncing only this sub-region's bo (whose effect on the parent is
+        unclear), the parent's current residency is set to this sub-view's
+        residency and the *entire parent buffer* is synced. This makes the
+        behaviour explicit and consistent with a caller that writes a sub-view
+        and then pushes it to the device.
+
+        FIXME: This assumes a sub-buffer sync means a whole-parent sync, which
+        is ambiguous in XRT: it is unclear whether ``bo.sync()`` on a sub-buffer
+        transfers only its slice or the whole parent. Because we sync the whole
+        parent here, moving one sub-buffer to a device can clobber sibling
+        sub-buffers that view the same parent (e.g. a host->device sync will
+        overwrite the device side of a sibling whose fresh device data has not
+        been synced back to the host yet). Those siblings are not notified and
+        keep a now-stale ``device`` flag. Revisit once XRT's sub-buffer sync
+        semantics are pinned down (or track per-region dirtiness).
+        """
+        if self._parent is not None:
+            # Reflect this sub-view's current residency onto the parent (e.g.
+            # "cpu" after a torch_view() write) so the parent's own sync fires
+            # instead of no-opping, then sync the whole parent buffer.
+            self._parent.device = self.device
+            result = self._parent.to(target_device)
+            self.device = self._parent.device
+            return result
+        return super().to(target_device)
+
+    @classmethod
+    def from_parent(cls, parent, shape, offset_elements, length_elements, dtype):
+        """Create an XRTSubBuffer into a sub-region of a parent XRTTensor.
+
+        Accepts element-count offsets/lengths and converts to bytes internally.
+        XRTTensor has no built-in slice API; use this until mlir-aie gains
+        XRTTensor.__getitem__ slice support.
+        """
+        itemsize = np.dtype(dtype).itemsize
+        return cls(
+            parent_bo=parent.buffer_object(),
+            offset_bytes=offset_elements * itemsize,
+            size_bytes=length_elements * itemsize,
+            shape=shape,
+            dtype=dtype,
+            parent=parent,
+        )

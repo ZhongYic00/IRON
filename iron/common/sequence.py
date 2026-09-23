@@ -7,49 +7,18 @@ import time
 from pathlib import Path
 import numpy as np
 import ml_dtypes
+import pyxrt
+import torch
 from . import compilation as comp
 from .base import AIEOperatorBase, MLIROperator
+from .utils import XRTSubBuffer
 import aie.utils as aie_utils
 from aie.iron.device import NPU2
+from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
 from aie.utils.hostruntime.tensor_class import CPUOnlyTensor
 from aie.utils.npukernel import NPUKernel
 
-try:
-    import pyxrt
-    from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
-except ImportError:
-    # Host stacks without XRT (e.g. the HRX/amdxdna runtime) have no pyxrt. The two
-    # on-device dispatch policies below are XRT-native (pyxrt.elf / hw_context / run,
-    # plus XRTTensor views), so they cannot run there; _require_xrt() makes that
-    # explicit at construction. The CPU policy and the whole compile path do not care,
-    # and must keep importing.
-    pyxrt = None
-    XRTTensor = None
-
 logger = logging.getLogger(__name__)
-
-
-def _torch():
-    """Import torch for CPU reference/compare paths. Compile and NPU dispatch do not."""
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError(
-            "OperatorSequence CPU reference/compare modes need torch. "
-            "Compile and NPU dispatch do not."
-        ) from exc
-    return torch
-
-
-def _require_xrt() -> None:
-    """Fail with the reason, rather than an AttributeError on ``None.elf``."""
-    if pyxrt is None:
-        raise RuntimeError(
-            "this OperatorSequence dispatch policy needs the XRT host runtime (pyxrt), "
-            "which is not installed. Use SequenceCPUCallable, or run a single operator "
-            "(AIEOperatorBase), which dispatches through aie.utils.DefaultNPURuntime and "
-            "works on any backend."
-        )
 
 
 # ##########################################################################
@@ -97,12 +66,6 @@ class AutoDispatch(SequenceDispatch):
         return SeparateDispatch()
 
 
-def _trace_tag(seq):
-    """Tracing adds a runtime-sequence argument, so a traced build cannot reuse an
-    untraced one's ELF. Empty when untraced."""
-    return f"_traced{seq.trace_size}" if seq.trace_size else ""
-
-
 class FusedDispatch(SequenceDispatch):
     """Single-ELF dispatch (NPU2 only): all operators fused into one ELF."""
 
@@ -119,11 +82,10 @@ class FusedDispatch(SequenceDispatch):
         mlir_artifact = self.build_fused_mlir(seq)
         kernel_objects = self._collect_kernel_artifacts(seq)
         full_elf_artifact = comp.FullElfArtifact(
-            f"{seq.name}{_trace_tag(seq)}.elf",
+            f"{seq.name}.elf",
             mlir_input=mlir_artifact,
             dependencies=[mlir_artifact] + kernel_objects,
             extra_flags=seq.extra_flags,
-            trace_size=seq.trace_size,
         )
         seq.add_artifacts([full_elf_artifact])
 
@@ -151,25 +113,54 @@ class FusedDispatch(SequenceDispatch):
             comp_runlist.append((design_names[design_of[id(op)]], *bufs))
 
         return comp.SequenceMLIRArtifact(
-            f"{seq.name}{_trace_tag(seq)}_fused.mlir",
+            seq.name + "_fused.mlir",
             operator_mlir_map=operator_mlir_map,
             runlist=comp_runlist,
             subbuffer_layout=seq.subbuffer_layout,
             buffer_sizes=seq.buffer_sizes,
             slice_info=seq.slice_info,
-            trace_size=seq.trace_size,
+            independent_order=seq.independent_order,
+            independent_sizes=seq.independent_sizes,
         )
 
     def _collect_kernel_artifacts(self, seq):
-        """Kernel artifacts from all child operators, prefixed per operator index."""
+        """Kernel artifacts from all child operators, prefixed per operator index.
+
+        Prefixes are applied RECURSIVELY through KernelArchiveArtifact so that
+        the object files bundled inside a static archive also get the per-op
+        symbol prefix.  Without this, a fused-epilogue GEMV (which ships matvec +
+        gelu/silu as an archive) links with undefined ``op{idx}_*`` symbols when
+        placed into an OperatorSequence.
+        """
         kernel_artifacts = []
         for idx, op in enumerate(seq.unique_designs()[0]):
             objs = op.get_kernel_artifacts()
             for obj in objs:
-                obj.filename = f"op{idx}_{obj.filename}"
-                obj.prefix_symbols = f"op{idx}_"
+                self._prefix_kernel_artifact_tree(obj, f"op{idx}_")
             kernel_artifacts.extend(objs)
         return kernel_artifacts
+
+    def _prefix_kernel_artifact_tree(self, artifact, prefix):
+        """Rename a kernel artifact and recursively prefix its kernel-object
+        dependencies (e.g. the .o files inside a KernelArchiveArtifact).
+
+        Only build artifacts (KernelObjectArtifact/KernelArchiveArtifact) are
+        renamed; SourceArtifact dependencies (.cc sources) keep their on-disk
+        filenames, or compilation can no longer find them.
+        """
+        if isinstance(artifact, comp.KernelObjectArtifact):
+            artifact.filename = f"{prefix}{artifact.filename}"
+            # COMBINE with any op-level symbol prefix (e.g. "down_" for a second
+            # DIM_K binding of the same C symbol): the MLIR call site is
+            # f"{prefix}{existing}<sym>", so the objcopy rename must produce
+            # exactly that. Overwriting (the old behaviour) dropped the op-level
+            # prefix and broke single-op multi-DIM_K designs at link time.
+            existing = getattr(artifact, "prefix_symbols", None)
+            artifact.prefix_symbols = prefix + (existing or "")
+        elif isinstance(artifact, comp.KernelArchiveArtifact):
+            artifact.filename = f"{prefix}{artifact.filename}"
+        for dep in getattr(artifact, "dependencies", []):
+            self._prefix_kernel_artifact_tree(dep, prefix)
 
     def make_callable(self, seq):
         return SequenceFullELFCallable(seq)
@@ -304,8 +295,9 @@ class OperatorSequence(AIEOperatorBase):
         buffer_sizes=None,
         dispatch="auto",
         extra_flags=None,
-        trace_size=0,
         share_designs=False,
+        independent_buffer_args=None,
+        independent_buffer_groups=None,
         *args,
         **kwargs,
     ):
@@ -328,10 +320,22 @@ class OperatorSequence(AIEOperatorBase):
         self.explicit_buffer_sizes = (
             buffer_sizes or {}
         )  # Optional dict: buffer_name -> size_in_bytes
-        # Extra aiecc flags forwarded to the full-ELF build.
+        # Input args promoted to their own top-level set_arg (their own
+        # buffer_type = arg name) instead of being packed into the "input"
+        # buffer.  Enables zero-copy K/V: the host set_arg binds a persistent
+        # KV BO directly instead of copying into the packed input buffer.
+        self.independent_buffer_args = independent_buffer_args or []
+        # Optional dict: group_name -> [buffer names].  Members of a group each
+        # keep their own runtime_sequence %arg (set_arg slot) but SHARE one
+        # top-level host BO via sub-views at per-member offsets.  This caps any
+        # single device-visible BO below hardware addressing limits (e.g. the
+        # 4GB 32-bit DMA offset wrap) while keeping the number of set_arg slots
+        # equal to the number of buffers.
+        self.independent_buffer_groups = independent_buffer_groups or {}
+        # Extra aiecc flags forwarded to the full-ELF build (e.g. --dynamic-objFifos
+        # for placed/routed whole-array designs that would otherwise overflow AIE2p
+        # program memory). Empty by default, so other sequences are unaffected.
         self.extra_flags = extra_flags or []
-        # Bytes of hardware trace buffer per runlist step; 0 leaves the design untraced.
-        self.trace_size = trace_size
         self.share_designs = share_designs
         self._dispatch = dispatch
 
@@ -436,27 +440,37 @@ class OperatorSequence(AIEOperatorBase):
                     # Explicit size specified - this is a parent buffer for slices
                     length = self.explicit_buffer_sizes[arg]
                     subbuffer_layout[arg] = (buffer_type, offset, length)
-                    offset += length
+                    # 64B-align every buffer: operators whose kernels use wide
+                    # vector loads (load_v<128> = 128B) assume their tile base
+                    # is aligned; an unaligned arena offset resurfaces the
+                    # load_v footgun INSIDE a correctly-packed wire (same
+                    # lesson as independent_buffer_groups' 64B rule below).
+                    offset += (length + 63) & ~63
                 elif arg in args:
                     arg_spec = args[arg]
                     length = int(
                         np.prod(arg_spec.shape) * np.dtype(arg_spec.dtype).itemsize
                     )
                     subbuffer_layout[arg] = (buffer_type, offset, length)
-                    offset += length
+                    offset += (length + 63) & ~63
                 # Note: sliced buffers are handled separately, not in args_list
-            return offset  # == total length
+            return offset  # == total length (64B-aligned tail included)
 
         # Add sliced buffer entries to layout (they reference parent buffers)
         for buf_name, (base_name, start, end, args_spec) in sliced_buffers.items():
             slice_info[buf_name] = (base_name, start, end)
 
-        input_buffer_size = add_buffers("input", self.input_args)
+        independent = set(self.independent_buffer_args)
+        packed_input = [a for a in self.input_args if a not in independent]
+
+        input_buffer_size = add_buffers("input", packed_input)
         output_buffer_size = add_buffers("output", self.output_args)
         scratch_args = [
             arg
             for arg in args
-            if arg not in self.input_args and arg not in self.output_args
+            if arg not in self.input_args
+            and arg not in self.output_args
+            and arg not in independent
         ]
         # Also include explicit buffers that are only used for slicing
         for explicit_buf in self.explicit_buffer_sizes:
@@ -464,18 +478,52 @@ class OperatorSequence(AIEOperatorBase):
                 explicit_buf not in self.input_args
                 and explicit_buf not in self.output_args
                 and explicit_buf not in scratch_args
+                and explicit_buf not in independent
             ):
                 scratch_args.append(explicit_buf)
         scratch_buffer_size = add_buffers("scratch", scratch_args)
 
+        # Independent buffer args (their own buffer type = arg name) get their
+        # own top-level set_arg; they need not be in input_args -- e.g. K/V
+        # cache written by StridedCopy and read by MHA.
+        independent_order = list(self.independent_buffer_args)
+        independent_sizes = [add_buffers(name, [name]) for name in independent_order]
+
+        # Shared-BO groups: record per-member byte offsets inside each group's
+        # parent BO (64B-aligned) and per-member sizes, so the runtime callable
+        # can slice one parent XRTTensor into the members' set_arg sub-BOs.
+        self.independent_group_offsets = {}
+        self.independent_member_sizes = {}
+        for gname, members in (self.independent_buffer_groups or {}).items():
+            offsets = {}
+            off = 0
+            for m in members:
+                length = int(
+                    np.prod(args[m].shape) * np.dtype(args[m].dtype).itemsize
+                )
+                offsets[m] = off
+                off += (length + 63) & ~63  # 64B align
+                self.independent_member_sizes[m] = length
+            self.independent_group_offsets[gname] = offsets
+
         buffer_sizes = (input_buffer_size, output_buffer_size, scratch_buffer_size)
-        return subbuffer_layout, buffer_sizes, slice_info
+        return (
+            subbuffer_layout,
+            buffer_sizes,
+            slice_info,
+            independent_order,
+            independent_sizes,
+        )
 
     def set_up_artifacts(self):
         """Resolve the dispatch policy and build its compile artifacts."""
-        self.subbuffer_layout, self.buffer_sizes, self.slice_info = (
-            self.calculate_buffer_layout()
-        )
+        (
+            self.subbuffer_layout,
+            self.buffer_sizes,
+            self.slice_info,
+            self.independent_order,
+            self.independent_sizes,
+        ) = self.calculate_buffer_layout()
         self._dispatch = self._dispatch.resolve(aie_utils.get_current_device())
         self._dispatch.set_up_artifacts(self)
 
@@ -585,7 +633,6 @@ class SequenceFullELFCallable(SequenceCallable):
     """
 
     def __init__(self, op, device_name="main", sequence_name="sequence"):
-        _require_xrt()
         self.device_name = device_name
         self.sequence_name = sequence_name
 
@@ -605,8 +652,31 @@ class SequenceFullELFCallable(SequenceCallable):
         self.run_handle.set_arg(0, self.input_buffer.buffer_object())
         self.run_handle.set_arg(1, self.output_buffer.buffer_object())
         self.run_handle.set_arg(2, self.scratch_buffer.buffer_object())
-        if self.trace_buffer is not None:
-            self.run_handle.set_arg(3, self.trace_buffer.buffer_object())
+        for i, name in enumerate(self.op.independent_order):
+            group_view = self._independent_group_view(name)
+            if group_view is not None:
+                # Shared-BO group member: bind its sub-BO (device address =
+                # group parent base + member offset).
+                self.run_handle.set_arg(3 + i, group_view.buffer_object())
+            else:
+                self.run_handle.set_arg(3 + i, self.independent_buffers[name].buffer_object())
+
+        # Hardware trace buffer: when tracing is enabled (IRON_TRACE_SIZE, which
+        # the compiled sequence also saw), the runtime_sequence has one trailing
+        # memref<trace_size x i8> argument that the trace lowering's shim DMA
+        # writes into. Allocate it, bind it at the tail slot, and expose it for
+        # host-side readback after a dispatch.
+        import os as _os
+        _trace_size = int(_os.environ.get("IRON_TRACE_SIZE", "0"))
+        self.trace_buffer = None
+        self.trace_size = 0
+        if _trace_size > 0:
+            self.trace_size = _trace_size
+            n_data_args = 3 + len(self.op.independent_order)
+            self.trace_buffer = XRTTensor(
+                (_n_elements(_trace_size),), dtype=np.dtype(np.int8)
+            )
+            self.run_handle.set_arg(n_data_args, self.trace_buffer.buffer_object())
 
         self._params = None
 
@@ -614,21 +684,22 @@ class SequenceFullELFCallable(SequenceCallable):
     def params(self):
         """Lazy ParameterScratchpad bound to this ELF's ctrl scratchpad BO.
 
-        The ``params.txt`` describing the runtime parameters is requested from
-        aiecc via ``--get-scratchpad-parameters``; it is a graph output, so it
-        lands in aiecc's ``--output-dir``, which compile_mlir_module() points at
-        the work dir (see ``_aiecc_work_dir``) for the fused MLIR source.
-        Returns ``None`` if the sequence declared no runtime parameters: the
-        file is still written, but holds a count of zero and there is no ctrl
-        scratchpad buffer object to bind to.
+        The ``params.txt`` describing the runtime parameters is emitted by
+        ``aiecc --get-scratchpad-parameters`` into the build directory next to
+        the fused MLIR source. Returns ``None`` if the sequence declared no
+        runtime parameters (in which case the file is not written).
         """
         if self._params is not None:
             return self._params
-        mlir_filename = self.op.artifacts[0].mlir_input.filename
-        params_path = comp._aiecc_work_dir(mlir_filename) / "params.txt"
-        if not params_path.exists():
-            return None
-        if params_path.read_text().split("\n", 1)[0].strip() == "0":
+        mlir_file = Path(self.op.artifacts[0].mlir_input.filename)
+        # aiecc (>= 1.4.0) emits `params.txt` into the build directory next to
+        # the fused `.mlir` (its `scratchpad-parameters` edge outputs a file
+        # literally named `params.txt` in the process cwd).  Older setups may
+        # have placed it under `<mlir>.prj/`, so fall back to that location.
+        candidate_paths = [mlir_file.with_name("params.txt")]
+        candidate_paths.append(mlir_file.parent / (mlir_file.name + ".prj") / "params.txt")
+        params_path = next((p for p in candidate_paths if p.exists()), None)
+        if params_path is None:
             return None
         from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import (
             ParameterScratchpad,
@@ -644,23 +715,95 @@ class SequenceFullELFCallable(SequenceCallable):
         self.scratch_buffer = XRTTensor(
             (_n_elements(scratch_sz),), dtype=ml_dtypes.bfloat16
         )
-        # Trace lowering appends one buffer covering every configured design, after
-        # the consolidated three. Its size depends on how many channels and
-        # sub-designs claim a share, so read it from the lowered module.
-        self.trace_buffer = None
-        if self.op.trace_size:
-            total = comp.trace_buffer_size(self.lowered_mlir_text())
-            if total:
-                self.trace_buffer = XRTTensor((total,), dtype=np.int8)
+        # Independent input args get their own top-level BO.  They are bound to
+        # dedicated set_arg slots; the host may re-bind a persistent BO before
+        # each dispatch (zero-copy K/V).
+        #
+        # Members of an `independent_buffer_groups` entry instead share ONE
+        # top-level BO: the group's parent XRTTensor is sliced into per-member
+        # XRTSubBuffers at consecutive 64B-aligned offsets, and each member's
+        # set_arg binds its sub-BO (device address = parent base + offset).  This
+        # caps any single device BO below the 32-bit DMA offset limit while
+        # keeping one set_arg slot per member buffer.
+        self.independent_buffers = {}
+        # name -> (parent XRTTensor, group_name) for group members
+        self._independent_group_member = {}
+        groups = getattr(self.op, "independent_buffer_groups", {}) or {}
+        member_to_group = {}
+        for gname, members in groups.items():
+            for m in members:
+                member_to_group[m] = gname
 
-    def lowered_mlir_text(self) -> str:
-        """aiecc's post-lowering module, which carries the trace buffer layout."""
-        mlir_filename = self.op.artifacts[0].mlir_input.filename
-        path = comp._aiecc_work_dir(mlir_filename) / "input_with_addresses.mlir"
-        return path.read_text()
+        # Parent BOs for independent buffers, keyed by buffer name (ungrouped)
+        # or group name (grouped).
+        sizes_by_name = dict(
+            zip(self.op.independent_order, self.op.independent_sizes)
+        )
+        for name in self.op.independent_order:
+            if name in member_to_group:
+                continue  # allocated below via its group parent
+            self.independent_buffers[name] = XRTTensor(
+                (_n_elements(sizes_by_name[name]),), dtype=ml_dtypes.bfloat16
+            )
+        for gname, members in groups.items():
+            # parent BO size = last member offset + size (covers 64B padding)
+            last_off = self.op.independent_group_offsets[gname][members[-1]]
+            last_len = self.op.independent_member_sizes[members[-1]]
+            parent = XRTTensor(
+                (_n_elements(last_off + last_len),), dtype=ml_dtypes.bfloat16
+            )
+            self.independent_buffers[gname] = parent
+            for m in members:
+                self._independent_group_member[m] = gname
+
+    def _independent_group_view(self, name):
+        """Sub-view of `name` inside its shared group parent BO (or None if the
+        buffer is not a member of a sharing group)."""
+        gname = self._independent_group_member.get(name)
+        if gname is None:
+            return None
+        parent = self.independent_buffers[gname]
+        offset = self.op.independent_group_offsets[gname][name]
+        length = self.op.independent_member_sizes[name]
+        return XRTSubBuffer(
+            parent_bo=parent.buffer_object(),
+            offset_bytes=offset,
+            size_bytes=length,
+            shape=(length // BF16.itemsize,),
+            dtype=ml_dtypes.bfloat16,
+            parent=parent,
+        )
+
+    def sync_independent_buffers(self):
+        """Push every independent buffer to the device. Members of a shared-BO
+        group need only one sync per group parent BO."""
+        if not hasattr(self, "_group_synced"):
+            self._group_synced = set()
+        for name in self.op.independent_order:
+            gname = self._independent_group_member.get(name)
+            if gname is not None:
+                if gname in self._group_synced:
+                    continue
+                self.independent_buffers[gname].to("npu")
+                self._group_synced.add(gname)
+            else:
+                self.independent_buffers[name].to("npu")
 
     def get_buffer(self, buffer_name):
         if buffer_name in self._buffer_cache:
+            return self._buffer_cache[buffer_name]
+        # Group member: return the sub-view of its shared parent BO (each member
+        # still owns its own set_arg slot; the sub-BO's device address is the
+        # parent base + the member's offset).
+        group_view = self._independent_group_view(buffer_name)
+        if group_view is not None:
+            self._buffer_cache[buffer_name] = group_view
+            return self._buffer_cache[buffer_name]
+        if buffer_name in self.independent_buffers:
+            # Independent input arg: return its own top-level BO directly (not a
+            # sub-view of the packed input buffer), so the host can write/persist
+            # it independently.
+            self._buffer_cache[buffer_name] = self.independent_buffers[buffer_name]
             return self._buffer_cache[buffer_name]
         buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
         parent = {
@@ -668,26 +811,55 @@ class SequenceFullELFCallable(SequenceCallable):
             "output": self.output_buffer,
             "scratch": self.scratch_buffer,
         }[buf_type]
-        sub = parent.subview(offset, (length // BF16.itemsize,), ml_dtypes.bfloat16)
+        sub = XRTSubBuffer(
+            parent_bo=parent.buffer_object(),
+            offset_bytes=offset,
+            size_bytes=length,
+            shape=(length // BF16.itemsize,),
+            dtype=ml_dtypes.bfloat16,
+            parent=parent,
+        )
         self._buffer_cache[buffer_name] = sub
         return sub
 
     def _sync_inputs(self):
-        # Sub-views handed out by get_buffer() share the parent's coherence map, so
-        # a write through one (e.g. torch_view()) marks its byte range host-dirty
-        # there too, and `to("npu")` here syncs every dirty range in one pass.
+        # Sub-views handed out by get_buffer() mark this parent host-dirty on .data
+        # access (XRTSubBuffer.data), so `to("npu")` here actually fires the host->device
+        # sync for the freshly written inputs.
         self.input_buffer.to("npu")
+        # The scratch buffer hosts every packed weight sub-view written host-side
+        # between dispatches; without this push the device keeps running on the
+        # BO's uninitialized/garbage allocation.  The residency guard makes this a
+        # no-op after the first push (and after any dispatch), so device-written
+        # scratch state (inter-op buffers, KV cache) is never clobbered by a stale
+        # host mirror.
+        # Large scratch BOs (>~64MB) silently fail a whole-buffer sync on this
+        # XRT build (back-region weights stay NaN), so push in slices.
+        # Whole-buffer sync of a large scratch BO silently fails on this XRT
+        # build (back-region weights stay NaN).  Sync via per-region sub-BOs
+        # instead (each sub-BO sync transfers only its own region).
+        _sb = self.scratch_buffer
+        _n = _sb.data.size
+        _itemsize = _sb.data.itemsize
+        _chunk_elems = 8 * 1024 * 1024  # 16MB per slice
+        for _off in range(0, _n, _chunk_elems):
+            _cnt = min(_chunk_elems, _n - _off)
+            _sub = XRTSubBuffer(
+                parent_bo=_sb.buffer_object(),
+                offset_bytes=_off * _itemsize,
+                size_bytes=min(_chunk_elems, _n - _off) * _itemsize,
+                shape=(min(_chunk_elems, _n - _off),),
+                dtype=ml_dtypes.bfloat16,
+            )  # no parent: sync this region only
+            _sub._sync_to_device()
 
     def _sync_outputs(self):
         # _run just rewrote the output arena on the device, so the device holds the
         # authoritative copy. Force the device->host sync: assert device residency first
-        # so `to("cpu")` fires even if a prior read of get_buffer(...) marked some
-        # range "cpu" (otherwise a looped dispatch would read stale output).
+        # so `to("cpu")` fires even if a prior read of get_buffer(...).data marked the
+        # buffer "cpu" (otherwise a looped dispatch would read stale output).
         self.output_buffer.device = "npu"
         self.output_buffer.to("cpu")
-        if self.trace_buffer is not None:
-            self.trace_buffer.device = "npu"
-            self.trace_buffer.to("cpu")
 
     def _run(self):
         self.run_handle.start()
@@ -705,6 +877,9 @@ class _PerBufferCallable(SequenceCallable):
     def _make_buffer(self, n_elements):
         raise NotImplementedError
 
+    def _make_subbuffer(self, parent, offset_bytes, size_bytes):
+        raise NotImplementedError
+
     def _allocate_buffers(self):
         self._buffers = {}
         for name, (_, _, length) in self.op.subbuffer_layout.items():
@@ -715,9 +890,8 @@ class _PerBufferCallable(SequenceCallable):
             return self._buffers[buf_name]
         if buf_name in self.op.slice_info:
             base_name, start_bytes, end_bytes = self.op.slice_info[buf_name]
-            size_bytes = end_bytes - start_bytes
-            sub = self._buffers[base_name].subview(
-                start_bytes, (size_bytes // BF16.itemsize,), BF16
+            sub = self._make_subbuffer(
+                self._buffers[base_name], start_bytes, end_bytes - start_bytes
             )
             self._buffers[buf_name] = sub
             return sub
@@ -747,22 +921,21 @@ class SequenceXclbinCallable(_PerBufferCallable):
     """
 
     def __init__(self, op, dispatch):
-        _require_xrt()
         self._dispatch = dispatch
         super().__init__(op)
 
-    def _sync_outputs(self):
-        # _run rewrote these on the device, which the coherence map does not observe.
-        # Assert device residency first so the pull fires even when a prior read left
-        # the range marked "cpu"; otherwise a second dispatch reads the first's output.
-        for name in self.op.subbuffer_layout:
-            if name not in self.op.input_args:
-                buf = self._buffers[name]
-                buf.device = "npu"
-                buf.to("cpu")
-
     def _make_buffer(self, n_elements):
         return XRTTensor((n_elements,), dtype=ml_dtypes.bfloat16)
+
+    def _make_subbuffer(self, parent, offset_bytes, size_bytes):
+        return XRTSubBuffer(
+            parent_bo=parent.buffer_object(),
+            offset_bytes=offset_bytes,
+            size_bytes=size_bytes,
+            shape=(size_bytes // BF16.itemsize,),
+            dtype=ml_dtypes.bfloat16,
+            parent=parent,
+        )
 
     def _allocate_buffers(self):
         super()._allocate_buffers()
@@ -810,12 +983,17 @@ class SequenceReferenceCallable(_PerBufferCallable):
     def _make_buffer(self, n_elements):
         return CPUOnlyTensor((n_elements,), dtype=BF16)
 
-    def _sync_inputs(self):
-        # CPU-only inputs must stay CPU-resident, including lazily created subviews.
-        pass
+    def _make_subbuffer(self, parent, offset_bytes, size_bytes):
+        start = offset_bytes // BF16.itemsize
+        end = (offset_bytes + size_bytes) // BF16.itemsize
+        # Alias the parent's memory (numpy slice is zero-copy) so a write to
+        # this slice is visible when a later step reads the parent by name.
+        view = CPUOnlyTensor((end - start,), dtype=BF16)
+        view._data = parent.data[start:end]
+        view._shape = view._data.shape
+        return view
 
     def _run(self):
-        torch = _torch()
         for step_op, in_names, in_specs, out_name, out_spec in self._iter_steps():
             inputs = [
                 _reshape_for_spec(self._resolve_buffer(n).torch_view(), s).clone()
@@ -862,7 +1040,6 @@ class SequenceCompareCallable(SequenceXclbinCallable):
 
         kernel(*args)
 
-        torch = _torch()
         npu_out = self._read_to_cpu(out_name, out_spec).to(torch.float32)
         ref_out = step_op.reference(*cpu_inputs)
 
